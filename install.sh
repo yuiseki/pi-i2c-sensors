@@ -27,4 +27,4 @@ echo "  i2cdetect -y 1        # list devices (need i2c-tools: sudo apt install i
 echo "  pi-calib-mag          # live field strength, find a magnet-free spot"
 echo "  pi-calib              # tumble 30s -> ~/tmp/pi-calib.json"
 echo "  pi-orient             # publish orientation to /dev/shm/pi-orientation"
-echo "  pi-set-north          # zero the bearing at the current facing"
+echo "  pi-set-north / -south # set the bearing reference at the current facing"

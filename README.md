@@ -66,11 +66,14 @@ steady at rest, then EMA smooths the catch-up. Tune via env:
 `PI_ORIENT_BEAR_DB` (deg, default 6), `PI_ORIENT_PITCH_DB` (deg, default 3),
 `PI_ORIENT_ALPHA` (0..1, default 0.2, smaller = smoother).
 
-### `pi-set-north` - bearing zero reference
+### `pi-set-north` / `pi-set-south` - bearing reference
 
-Point the device the way you want to read as North, then run it. It folds the
-current bearing into an offset in `~/tmp/pi-north`; `pi-orient` applies it within
-~1 s. Touches no I2C, so it never fights a running `pi-orient`.
+Point the device the way you want to read as North (or South), then run the
+matching command. It folds the current bearing into an offset in `~/tmp/pi-north`
+so that facing reads 0 (`pi-set-north`) or 180 (`pi-set-south`); the rest of the
+circle follows. `pi-orient` applies the offset within ~1 s. Touches no I2C, so it
+never fights a running `pi-orient`. Use whichever cardinal direction is the
+convenient one to point at.
 
 ## Orientation pipeline
 
