@@ -1,0 +1,15 @@
+[Unit]
+Description=pi-env: publish BME280 temp/humidity/pressure to /dev/shm/pi-env
+After=local-fs.target
+
+[Service]
+Type=simple
+# User must be in the i2c group to read /dev/i2c-1 (no sudo needed).
+User=yuiseki
+ExecStart=/usr/local/bin/pi-env --daemon
+Restart=always
+RestartSec=2
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

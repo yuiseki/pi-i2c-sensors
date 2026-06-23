@@ -16,6 +16,7 @@ breaking out I2C1, but the tools are generic.
 | MSA311 3-axis accelerometer | `0x62` | `0x01` -> `0x13` | Bosch/MEMSIC; **powers up SUSPENDED** |
 | MMC5603 3-axis magnetometer | `0x30` | `0x39` -> `0x10` | MEMSIC; needs SET/RESET to null its offset |
 | u-blox 7 GPS/GNSS receiver | USB | - | USB CDC-ACM serial (`/dev/ttyACM0`), NMEA; not I2C |
+| BME280 temp/humidity/pressure | `0x77` (`0x76`) | `0xD0` -> `0x60` | Bosch; pressure is fine close to the Pi, but T/RH read hot (place it away for ambient) |
 
 Multiple Qwiic sensors share the one I2C1 bus, so they coexist with anything
 else already on it (e.g. a PiSugar at `0x57`/`0x68`). `i2cdetect -y 1` lists them.
@@ -111,6 +112,18 @@ the last known position. Needs the **dialout** group (no sudo); parses NMEA
 directly (no gpsd/pyserial). Runs harmlessly with no GPS attached (keeps
 publishing `fix=0`). The map consumer recentres on the position when `fix >= 1`.
 
+### `pi-env` - BME280 environment (temp / humidity / pressure)
+
+One-shot by default: `pi-env` prints `27.5 C  45 %RH  1010.5 hPa`, also writes
+`<temp_c> <humidity_pct> <pressure_hpa> <have>` to `/dev/shm/pi-env`, and exits
+(a plain non-interactive CLI). `pi-env --daemon` keeps measuring ~every 2 s for
+a consumer (systemd unit). Bosch float compensation is inlined (no driver libs).
+
+Placement matters: the **pressure** reading is accurate even right next to the
+Pi, but **temperature/humidity read hot** there (the Pi's heat). For ambient
+T/RH put the sensor on a Qwiic cable away from the Pi (the dew point of the hot
+reading matches the room, confirming it is the same air measured warm).
+
 ## Orientation pipeline
 
 ```
@@ -130,12 +143,15 @@ microSD is never written in a hot loop.
 So the orientation + GPS feeds are always available:
 
 ```bash
-sudo cp systemd/pi-orient.service systemd/pi-gps.service /etc/systemd/system/
+sudo cp systemd/pi-orient.service systemd/pi-gps.service systemd/pi-env.service /etc/systemd/system/
 # the units run as User=yuiseki; edit if your user differs
 sudo systemctl daemon-reload
-sudo systemctl enable --now pi-orient.service pi-gps.service
-systemctl status pi-orient.service pi-gps.service
+sudo systemctl enable --now pi-orient.service pi-gps.service pi-env.service
+systemctl status pi-orient.service pi-gps.service pi-env.service
 ```
+
+(`pi-env` needs `--daemon`, which its unit already passes; the bare command is a
+one-shot CLI.)
 
 Both suppress their live ANSI display when not on a terminal, so the journal
 stays clean, and both survive their device being absent or hot-plugged

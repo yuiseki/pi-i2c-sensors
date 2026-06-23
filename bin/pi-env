@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""pi-env : read a Bosch BME280 (temperature / humidity / pressure).
+
+Default (no args): one-shot. Take a single forced measurement, print
+"<t> C  <h> %RH  <p> hPa", also publish it to /dev/shm/pi-env, and exit. A
+plain non-interactive CLI (no Ctrl-C needed).
+
+--daemon (-d): keep measuring ~every 2 s and publishing for the map; used by
+the systemd unit.
+
+Published line: "<temp_c> <humidity_pct> <pressure_hpa> <have>" on /dev/shm
+(tmpfs = RAM). I2C 0x77 (or 0x76); i2c group, auto-sudo. Dependency-light:
+Bosch float compensation inlined, no driver libs. Harmless with no sensor.
+"""
+import os, sys, time
+
+try:
+    from smbus2 import SMBus
+except ImportError:
+    try:
+        from smbus import SMBus
+    except ImportError:
+        SMBus = None
+
+OUT = "/dev/shm/pi-env"
+ADDRS = (0x77, 0x76)
+
+
+def open_bus():
+    if SMBus is None:
+        return None
+    try:
+        return SMBus(1)
+    except PermissionError:
+        os.execvp("sudo", ["sudo", sys.executable] + sys.argv)
+    except OSError:
+        return None
+
+
+def s16(v):
+    return v - 65536 if v >= 32768 else v
+
+
+def s12(v):
+    return v - 4096 if v >= 2048 else v
+
+
+def s8(v):
+    return v - 256 if v >= 128 else v
+
+
+def find(bus):
+    if bus is None:
+        return None
+    for a in ADDRS:
+        try:
+            if bus.read_byte_data(a, 0xD0) == 0x60:   # BME280 chip id
+                return a
+        except OSError:
+            pass
+    return None
+
+
+def read_calib(bus, a):
+    c = bus.read_i2c_block_data(a, 0x88, 26)
+    h = bus.read_i2c_block_data(a, 0xE1, 7)
+    d = {
+        "T1": c[0] | c[1] << 8,
+        "T2": s16(c[2] | c[3] << 8),
+        "T3": s16(c[4] | c[5] << 8),
+        "P1": c[6] | c[7] << 8,
+        "P2": s16(c[8] | c[9] << 8),
+        "P3": s16(c[10] | c[11] << 8),
+        "P4": s16(c[12] | c[13] << 8),
+        "P5": s16(c[14] | c[15] << 8),
+        "P6": s16(c[16] | c[17] << 8),
+        "P7": s16(c[18] | c[19] << 8),
+        "P8": s16(c[20] | c[21] << 8),
+        "P9": s16(c[22] | c[23] << 8),
+        "H1": c[25],
+        "H2": s16(h[0] | h[1] << 8),
+        "H3": h[2],
+        "H4": s12((h[3] << 4) | (h[4] & 0x0F)),
+        "H5": s12((h[5] << 4) | (h[4] >> 4)),
+        "H6": s8(h[6]),
+    }
+    return d
+
+
+def configure(bus, a):
+    bus.write_byte_data(a, 0xF2, 0x01)   # ctrl_hum: humidity oversample x1
+    bus.write_byte_data(a, 0xF5, 0x00)   # config: no filter (forced mode per read)
+
+
+def measure(bus, a, d):
+    r = bus.read_i2c_block_data(a, 0xF7, 8)
+    praw = (r[0] << 12) | (r[1] << 4) | (r[2] >> 4)
+    traw = (r[3] << 12) | (r[4] << 4) | (r[5] >> 4)
+    hraw = (r[6] << 8) | r[7]
+
+    v1 = (traw / 16384.0 - d["T1"] / 1024.0) * d["T2"]
+    v2 = (traw / 131072.0 - d["T1"] / 8192.0)
+    v2 = v2 * v2 * d["T3"]
+    tfine = v1 + v2
+    temp = tfine / 5120.0
+
+    v1 = tfine / 2.0 - 64000.0
+    v2 = v1 * v1 * d["P6"] / 32768.0
+    v2 = v2 + v1 * d["P5"] * 2.0
+    v2 = v2 / 4.0 + d["P4"] * 65536.0
+    v1 = (d["P3"] * v1 * v1 / 524288.0 + d["P2"] * v1) / 524288.0
+    v1 = (1.0 + v1 / 32768.0) * d["P1"]
+    if v1 == 0:
+        press = 0.0
+    else:
+        p = 1048576.0 - praw
+        p = (p - v2 / 4096.0) * 6250.0 / v1
+        v1 = d["P9"] * p * p / 2147483648.0
+        v2 = p * d["P8"] / 32768.0
+        press = (p + (v1 + v2 + d["P7"]) / 16.0) / 100.0
+
+    h = tfine - 76800.0
+    h = (hraw - (d["H4"] * 64.0 + d["H5"] / 16384.0 * h)) * (
+        d["H2"] / 65536.0 * (1.0 + d["H6"] / 67108864.0 * h *
+                             (1.0 + d["H3"] / 67108864.0 * h)))
+    h = h * (1.0 - d["H1"] * h / 524288.0)
+    hum = max(0.0, min(100.0, h))
+    return temp, hum, press
+
+
+def measure_forced(bus, a, d):
+    bus.write_byte_data(a, 0xF4, 0x25)   # T x1, P x1, forced mode (one shot)
+    time.sleep(0.02)                     # ~9 ms max conversion at x1
+    return measure(bus, a, d)
+
+
+def publish(t, h, p, have):
+    tmp = OUT + ".tmp"
+    try:
+        with open(tmp, "w") as fh:
+            fh.write("%.2f %.1f %.1f %d\n" % (t, h, p, 1 if have else 0))
+        os.replace(tmp, OUT)
+    except OSError:
+        pass
+
+
+def main():
+    # Default: one-shot (measure once, print + publish, exit) so it is a plain
+    # non-interactive CLI. --daemon keeps publishing for the map (used by the
+    # systemd unit).
+    daemon = ("--daemon" in sys.argv) or ("-d" in sys.argv)
+    bus = open_bus()
+    a = find(bus)
+    d = None
+    if a is not None:
+        configure(bus, a)
+        d = read_calib(bus, a)
+
+    if not daemon:
+        if a is None:
+            publish(0.0, 0.0, 0.0, False)
+            print("no BME280 found (looked at 0x77 / 0x76)", file=sys.stderr)
+            return 1
+        t, h, p = measure_forced(bus, a, d)
+        publish(t, h, p, True)
+        print("%.1f C   %.0f %%RH   %.1f hPa" % (t, h, p))
+        return 0
+
+    n = 0
+    while True:
+        n += 1
+        if a is None:
+            publish(0.0, 0.0, 0.0, False)
+            if n % 5 == 0:
+                bus = bus or open_bus()
+                a = find(bus)
+                if a is not None:
+                    configure(bus, a)
+                    d = read_calib(bus, a)
+            time.sleep(1.0)
+            continue
+        try:
+            t, h, p = measure_forced(bus, a, d)
+        except OSError:
+            a = None
+            continue
+        publish(t, h, p, True)
+        time.sleep(2.0)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main() or 0)
+    except KeyboardInterrupt:
+        pass
