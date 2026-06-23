@@ -60,6 +60,34 @@ def load_north():
         return 0.0
 
 
+CARD = ("north", "east", "south", "west")
+
+
+def load_hfit():
+    """4-point horizontal calibration from pi-cal-point captures.
+
+    Needs all of pi-h-{north,east,south,west}.json. Returns (cx, cy, off):
+    residual hard-iron centre (cx,cy) and a rotation offset (rad) such that
+    heading = atan2(my-cy, mx-cx) + off. Centring from the four cardinals fixes
+    the leftover hard-iron the tumble missed; off aligns sensor X to true North.
+    """
+    pts = []
+    for d in CARD:
+        try:
+            r = json.load(open(os.path.join(HOME, "tmp", "pi-h-%s.json" % d)))
+            pts.append((r["mag"][0], r["mag"][1], math.radians(r["true_bearing"])))
+        except Exception:
+            return None
+    cx = sum(p[0] for p in pts) / len(pts)
+    cy = sum(p[1] for p in pts) / len(pts)
+    sx = sy = 0.0
+    for mx, my, tb in pts:
+        diff = tb - math.atan2(my - cy, mx - cx)
+        sx += math.cos(diff)
+        sy += math.sin(diff)
+    return (cx, cy, math.atan2(sy, sx))
+
+
 def s16(lo, hi):
     v = (hi << 8) | lo
     return v - 65536 if v >= 32768 else v
@@ -137,11 +165,15 @@ def field(bus):
     return [(s[i] - r[i]) / 2.0 / 16384.0 for i in range(3)]
 
 
-def publish(pitch, bearing, have):
+def publish(pitch, bearing, have, extra=""):
+    # Line: "<pitch> <bearing> <have> [<mcx> <mcy> <mcz> <ax> <ay> <az>]".
+    # The map consumer reads only the first three tokens; the appended
+    # calibrated-mag + accel fields let pi-cal-point capture references without
+    # touching I2C (no contention with this process).
     tmp = OUT + ".tmp"
     try:
         with open(tmp, "w") as fh:
-            fh.write("%.1f %.1f %d\n" % (pitch, bearing, 1 if have else 0))
+            fh.write("%.1f %.1f %d%s\n" % (pitch, bearing, 1 if have else 0, extra))
         os.replace(tmp, OUT)   # atomic on tmpfs
     except OSError:
         pass
@@ -184,6 +216,7 @@ def main():
     last_probe = 0.0
     n = 0
     offset = load_north()
+    hfit = load_hfit()
     try:
         while True:
             n += 1
@@ -220,21 +253,26 @@ def main():
             dot = max(-1.0, min(1.0, ax * arest[0] + ay * arest[1] + az * arest[2]))
             pitch_signed = math.degrees(math.acos(dot))   # 0 at rest, grows w/ tilt
 
-            # Heading from the horizontal X-Y axes only. In the mount the Z axis
-            # is soft-iron compressed (tiny range, scale ~4x) so its calibrated
-            # value is mostly amplified noise; feeding it into a tilt-compensated
-            # heading wrecks the result (diag: tilt-head jumped 2..324 while the
-            # plain X-Y heading sat rock-steady). The device sits ~flat, so X-Y
-            # is enough. (Trade-off: heading drifts a bit if pitched hard.)
+            # Heading from the horizontal X-Y axes only (the mount's Z axis is
+            # soft-iron compressed, so no tilt compensation). With a 4-point
+            # horizontal calibration (pi-cal-point N/E/S/W) use its residual
+            # hard-iron centre + rotation offset; otherwise fall back to the raw
+            # heading minus the pi-set-north offset.
             mx, my, mz = mc
-            heading = math.degrees(math.atan2(my, mx)) % 360
+            if abs(az) >= 0.6 and hfit is not None:
+                cx, cy, foff = hfit
+                heading = math.degrees(math.atan2(my - cy, mx - cx) + foff) % 360
+            else:
+                heading = (math.degrees(math.atan2(my, mx)) - offset) % 360
 
             pit = step_lin(pit, pitch_signed)
             hdg = step_ang(hdg, heading)
             if n % 25 == 0:                 # pick up pi-set-north changes live
                 offset = load_north()
-            bout = (hdg - offset) % 360.0
-            publish(pit, bout, True)
+            if n % 125 == 0:                # pick up new pi-cal-point captures
+                hfit = load_hfit()
+            extra = " %.4f %.4f %.4f %.4f %.4f %.4f" % (mc[0], mc[1], mc[2], ax, ay, az)
+            publish(pit, hdg, True, extra)
 
             if TTY:
                 sys.stdout.write("\033[2A\r\033[2K TILT(pitch) = %5.1f deg   BEARING = %5.1f deg   (have=1)\n"

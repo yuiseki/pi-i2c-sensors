@@ -10,6 +10,9 @@ User=yuiseki
 ExecStart=/usr/local/bin/pi-orient
 Restart=always
 RestartSec=2
+# Stay out of the way of the GUI/render process: low CPU priority.
+Nice=10
+CPUWeight=20
 
 [Install]
 WantedBy=multi-user.target

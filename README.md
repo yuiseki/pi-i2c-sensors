@@ -75,6 +75,27 @@ circle follows. `pi-orient` applies the offset within ~1 s. Touches no I2C, so i
 never fights a running `pi-orient`. Use whichever cardinal direction is the
 convenient one to point at.
 
+### `pi-cal-point <north|south|east|west>` - heading calibration points
+
+The accurate way to align the compass. Point the device at each TRUE cardinal
+direction (flat) and run it; it captures the live calibrated mag + accel from
+`/dev/shm/pi-orientation` (no I2C), auto-detects horizontal vs vertical from
+gravity, and saves `~/tmp/pi-h-<dir>.json` (or `pi-v-<dir>.json`). With all four
+horizontal points, `pi-orient` fits the residual hard-iron centre + a rotation
+offset, which corrects errors a single `pi-set-north` cannot (e.g. an
+off-centre, mildly elliptical horizontal circle left by an imperfect tumble).
+
+```bash
+# face true North (flat):  pi-cal-point north
+# face true East:          pi-cal-point east
+# face true South:         pi-cal-point south
+# face true West:          pi-cal-point west
+```
+
+`pi-orient` reloads the points every few seconds, so the fix applies without a
+restart. Prefer this 4-point fit; `pi-set-north`/`-south` remain a quick
+single-point fallback when the points are not present.
+
 ## Orientation pipeline
 
 ```

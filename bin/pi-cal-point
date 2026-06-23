@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""pi-cal-point <north|south|east|west> : capture a heading reference point.
+
+Point the device at the named TRUE compass direction and run this. It reads the
+live calibrated magnetometer + accelerometer that pi-orient publishes to
+/dev/shm/pi-orientation (so it touches no I2C and never fights pi-orient),
+auto-detects whether the device is HORIZONTAL or VERTICAL from gravity, and
+saves the reference to:
+
+    ~/tmp/pi-h-<dir>.json   (device flat / horizontal)
+    ~/tmp/pi-v-<dir>.json   (device upright / vertical)
+
+Collect north/south/east/west for a plane; a later fit step turns the four
+points into an accurate heading correction (offset + residual hard-iron).
+"""
+import os, sys, json, time, pwd
+
+TRUE = {"north": 0.0, "east": 90.0, "south": 180.0, "west": 270.0}
+SHM = "/dev/shm/pi-orientation"
+
+if len(sys.argv) != 2 or sys.argv[1] not in TRUE:
+    print("usage: pi-cal-point <north|south|east|west>")
+    sys.exit(2)
+d = sys.argv[1]
+
+# Average several fresh samples for a steady reference.
+mx = my = mz = ax = ay = az = 0.0
+n = 0
+for _ in range(20):
+    try:
+        t = open(SHM).read().split()
+        if len(t) >= 9 and int(t[2]) == 1:
+            mx += float(t[3]); my += float(t[4]); mz += float(t[5])
+            ax += float(t[6]); ay += float(t[7]); az += float(t[8])
+            n += 1
+    except (OSError, ValueError, IndexError):
+        pass
+    time.sleep(0.07)
+
+if n == 0:
+    print("no sensor data (have=0, or pi-orient not publishing the mag fields).")
+    print("Is pi-orient running and updated?  systemctl status pi-orient")
+    sys.exit(1)
+
+mx, my, mz, ax, ay, az = (v / n for v in (mx, my, mz, ax, ay, az))
+
+# Plane from gravity: flat -> Z dominant; upright -> Z near zero.
+if abs(az) >= 0.70:
+    plane = "h"
+elif abs(az) <= 0.50:
+    plane = "v"
+else:
+    print("ambiguous tilt (az=%.2f). Hold the device clearly FLAT or clearly UPRIGHT, then retry." % az)
+    sys.exit(1)
+
+try:
+    home = pwd.getpwnam(os.environ.get("SUDO_USER") or os.environ.get("USER") or "yuiseki").pw_dir
+except KeyError:
+    home = "/home/yuiseki"
+out = os.path.join(home, "tmp", "pi-%s-%s.json" % (plane, d))
+rec = {
+    "plane": plane,
+    "dir": d,
+    "true_bearing": TRUE[d],
+    "mag": [round(mx, 4), round(my, 4), round(mz, 4)],
+    "accel": [round(ax, 3), round(ay, 3), round(az, 3)],
+    "samples": n,
+}
+os.makedirs(os.path.dirname(out), exist_ok=True)
+with open(out, "w") as fh:
+    json.dump(rec, fh, indent=2)
+
+print("captured %s %s -> %s" % (plane.upper(), d, out))
+print("  mag=(%.3f %.3f %.3f)  accel=(%.2f %.2f %.2f)  (%d samples, plane=%s)"
+      % (mx, my, mz, ax, ay, az, n, plane))
