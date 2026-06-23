@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# runtime data produced on the device
+tmp/
+pi-calib.json
+pi-north

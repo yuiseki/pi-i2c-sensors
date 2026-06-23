@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""pi-calib : hard-iron (+ soft-iron) calibration for the MMC5603 magnetometer.
+
+TUMBLE the device slowly through every orientation so each magnetometer axis
+sees its full +/- swing. Watch the live ranges grow and "corrected|f|" settle
+to a roughly constant value (= clean sphere). Press Ctrl-C to compute and save
+the calibration to /tmp/pi-calib.json.
+
+Reads with SET/RESET to remove the sensor's intrinsic offset. Also records the
+resting accelerometer vector (gravity reference) for tilt compensation.
+"""
+import os, sys, time, math, json, pwd
+
+try:
+    from smbus2 import SMBus
+except ImportError:
+    from smbus import SMBus
+
+A = 0x62
+M = 0x30
+COVER = 0.45    # per-axis range (G) considered well covered (info only)
+DURATION = 30.0  # seconds, then auto-save best effort
+
+
+def _target_user():
+    # When auto-elevated via sudo, HOME is /root; resolve the real invoking user.
+    return os.environ.get("SUDO_USER") or os.environ.get("USER") or "yuiseki"
+
+
+try:
+    _pw = pwd.getpwnam(_target_user())
+    OUT = os.path.join(_pw.pw_dir, "tmp", "pi-calib.json")
+except KeyError:
+    _pw = None
+    OUT = "/home/yuiseki/tmp/pi-calib.json"
+
+
+def open_bus():
+    try:
+        return SMBus(1)
+    except PermissionError:
+        os.execvp("sudo", ["sudo", sys.executable] + sys.argv)
+
+
+def s16(lo, hi):
+    v = (hi << 8) | lo
+    return v - 65536 if v >= 32768 else v
+
+
+def u20(b0, b1, b2):
+    return (b0 << 12) | (b1 << 4) | (b2 >> 4)
+
+
+bus = open_bus()
+bus.write_byte_data(A, 0x11, 0x00)
+bus.write_byte_data(A, 0x0F, 0x00)
+bus.write_byte_data(A, 0x10, 0x08)
+bus.write_byte_data(M, 0x1C, 0x80)
+time.sleep(0.05)
+bus.write_byte_data(M, 0x1C, 0x00)
+time.sleep(0.02)
+
+
+def read_acc():
+    d = bus.read_i2c_block_data(A, 0x02, 6)
+    return [s16(d[0], d[1]) / 16384.0, s16(d[2], d[3]) / 16384.0,
+            s16(d[4], d[5]) / 16384.0]
+
+
+def mag_raw():
+    bus.write_byte_data(M, 0x1B, 0x01)
+    time.sleep(0.012)
+    m = bus.read_i2c_block_data(M, 0x00, 9)
+    return [u20(m[0], m[1], m[6]), u20(m[2], m[3], m[7]), u20(m[4], m[5], m[8])]
+
+
+def field():
+    bus.write_byte_data(M, 0x1B, 0x08)
+    time.sleep(0.004)
+    s = mag_raw()
+    bus.write_byte_data(M, 0x1B, 0x10)
+    time.sleep(0.004)
+    r = mag_raw()
+    return [(s[i] - r[i]) / 2.0 / 16384.0 for i in range(3)]
+
+
+mn = [1e9] * 3
+mx = [-1e9] * 3
+acc_sum = [0.0] * 3
+n = 0
+
+print("pi-calib : TUMBLE the device through every orientation for %d s." % int(DURATION))
+print("           auto-saves when the timer runs out (or Ctrl-C to save now).")
+for _ in range(6):
+    print("")
+t0 = time.time()
+try:
+    while True:
+        left = DURATION - (time.time() - t0)
+        if left <= 0:
+            break
+        try:
+            f = field()
+            a = read_acc()
+        except OSError:
+            time.sleep(0.2)
+            continue
+        n += 1
+        for i in range(3):
+            mn[i] = min(mn[i], f[i])
+            mx[i] = max(mx[i], f[i])
+            acc_sum[i] += a[i]
+        off = [(mn[i] + mx[i]) / 2 for i in range(3)]
+        rng = [mx[i] - mn[i] for i in range(3)]
+        corr = [f[i] - off[i] for i in range(3)]
+        cmag = math.sqrt(sum(c * c for c in corr))
+        good = [rng[i] >= COVER for i in range(3)]
+        sys.stdout.write("\033[6A")
+        sys.stdout.write("\033[2K samples=%d   raw|f|=%.3f G\n"
+                         % (n, math.sqrt(sum(v * v for v in f))))
+        for i, name in enumerate("XYZ"):
+            sys.stdout.write("\033[2K  %s  range=%.3f  %-12s offset=%+.3f\n"
+                             % (name, rng[i], "[OK]" if good[i] else "[turn more]", off[i]))
+        msg = "all axes covered!" if all(good) else "tumble more on [turn more] axes"
+        sys.stdout.write("\033[2K corrected|f|=%.3f G   time left %4.1fs   %s\n"
+                         % (cmag, left, msg))
+        sys.stdout.flush()
+        time.sleep(0.08)
+except KeyboardInterrupt:
+    pass
+
+off = [(mn[i] + mx[i]) / 2 for i in range(3)]
+rad = [(mx[i] - mn[i]) / 2 for i in range(3)]
+ravg = sum(rad) / 3.0
+scale = [(ravg / rad[i]) if rad[i] > 1e-6 else 1.0 for i in range(3)]
+acc = [acc_sum[i] / max(1, n) for i in range(3)]
+cal = {
+    "mag_offset": [round(v, 4) for v in off],
+    "mag_scale": [round(v, 4) for v in scale],
+    "field_radius_G": round(ravg, 4),
+    "mag_axis_range_G": [round(2 * r, 4) for r in rad],
+    "accel_rest": [round(v, 4) for v in acc],
+    "samples": n,
+}
+os.makedirs(os.path.dirname(OUT), exist_ok=True)
+with open(OUT, "w") as fh:
+    json.dump(cal, fh, indent=2)
+if _pw is not None and os.geteuid() == 0:
+    # running as root via sudo -- hand ownership back to the real user
+    try:
+        os.chown(os.path.dirname(OUT), _pw.pw_uid, _pw.pw_gid)
+        os.chown(OUT, _pw.pw_uid, _pw.pw_gid)
+    except OSError:
+        pass
+print("\n\nsaved %s" % OUT)
+print(json.dumps(cal, indent=2))
+if n and min(rad) < 0.5 * ravg:
+    weak = "XYZ"[rad.index(min(rad))]
+    print("\nWARNING: %s axis under-rotated (range small). Re-run and tumble more around it."
+          % weak)

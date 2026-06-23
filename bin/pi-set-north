@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""pi-set-north : make the device's CURRENT facing become map-north (bearing 0).
+
+Point the device the direction you want to read as North, then run this. It
+reads the live bearing from /dev/shm/pi-orientation (written by pi-orient),
+folds it into the bearing offset stored in ~/tmp/pi-north, and pi-orient picks
+the new offset up within ~1 s. Touches no I2C (so it never fights pi-orient).
+"""
+import os, sys, pwd
+
+SHM = "/dev/shm/pi-orientation"
+
+
+def _user():
+    return os.environ.get("SUDO_USER") or os.environ.get("USER") or "yuiseki"
+
+
+try:
+    HOME = pwd.getpwnam(_user()).pw_dir
+except KeyError:
+    HOME = "/home/yuiseki"
+NORTH = os.path.join(HOME, "tmp", "pi-north")
+
+try:
+    parts = open(SHM).read().split()
+    bearing = float(parts[1])
+    have = int(parts[2])
+except (OSError, IndexError, ValueError) as e:
+    print("cannot read %s (%s) -- is pi-orient running?" % (SHM, e))
+    sys.exit(1)
+
+if not have:
+    print("no sensor data (have=0) -- cannot set north")
+    sys.exit(1)
+
+try:
+    cur = float(open(NORTH).read().strip())
+except (OSError, ValueError):
+    cur = 0.0
+
+# Published bearing = (heading - offset). To make the current facing read 0,
+# add the current published bearing into the offset.
+new = (cur + bearing) % 360.0
+os.makedirs(os.path.dirname(NORTH), exist_ok=True)
+with open(NORTH, "w") as fh:
+    fh.write("%.2f\n" % new)
+
+print("north set: the current facing is now map-North (bearing 0).")
+print("offset = %.1f deg  (saved to %s; pi-orient applies it within ~1 s)" % (new, NORTH))

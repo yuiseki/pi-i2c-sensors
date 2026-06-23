@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""pi-calib-mag : live MMC5603 magnetic field-strength meter.
+
+Use it to find a mounting spot for the magnetometer where the background
+field |f| is near Earth's (~0.46 G). A high |f| means a magnet (PiSugar /
+speaker / display) is too close and will swamp the compass.
+
+Reads with SET/RESET each sample to remove the sensor's intrinsic offset, so
+|f| is the true external field. Ctrl-C to quit (prints the lowest |f| seen).
+"""
+import os, sys, time, math
+
+try:
+    from smbus2 import SMBus
+except ImportError:
+    from smbus import SMBus
+
+M = 0x30           # MMC5603
+EARTH = 0.46       # Tokyo total field, Gauss
+
+
+def open_bus():
+    try:
+        return SMBus(1)
+    except PermissionError:
+        # /dev/i2c-1 is root:i2c -- re-run under sudo (passwordless here).
+        os.execvp("sudo", ["sudo", sys.executable] + sys.argv)
+
+
+def u20(b0, b1, b2):
+    return (b0 << 12) | (b1 << 4) | (b2 >> 4)
+
+
+def mag_raw(bus):
+    bus.write_byte_data(M, 0x1B, 0x01)   # Take_meas_M
+    time.sleep(0.012)
+    m = bus.read_i2c_block_data(M, 0x00, 9)
+    return (u20(m[0], m[1], m[6]), u20(m[2], m[3], m[7]), u20(m[4], m[5], m[8]))
+
+
+def field(bus):
+    bus.write_byte_data(M, 0x1B, 0x08)   # SET
+    time.sleep(0.004)
+    s = mag_raw(bus)
+    bus.write_byte_data(M, 0x1B, 0x10)   # RESET
+    time.sleep(0.004)
+    r = mag_raw(bus)
+    return ((s[0] - r[0]) / 2.0 / 16384.0,
+            (s[1] - r[1]) / 2.0 / 16384.0,
+            (s[2] - r[2]) / 2.0 / 16384.0)
+
+
+def main():
+    bus = open_bus()
+    try:
+        bus.write_byte_data(M, 0x1C, 0x80)   # SW reset
+        time.sleep(0.05)
+        bus.write_byte_data(M, 0x1C, 0x00)   # BW = 0
+        time.sleep(0.02)
+    except OSError as e:
+        print("cannot reach MMC5603 at 0x30 (%s) -- check Qwiic wiring" % e,
+              file=sys.stderr)
+        return 1
+
+    print("pi-calib-mag : move the magnetometer to find a spot where")
+    print("               |f| ~= %.2f G (Earth only).  Ctrl-C to quit.\n" % EARTH)
+    print("")
+    print("")
+    mn = float("inf")
+    try:
+        while True:
+            try:
+                fx, fy, fz = field(bus)
+            except OSError:
+                sys.stdout.write("\033[2A\r\033[2K  I2C read error (unstable connection?)\n\033[2K\n")
+                sys.stdout.flush()
+                time.sleep(0.3)
+                continue
+            f = math.sqrt(fx * fx + fy * fy + fz * fz)
+            mn = min(mn, f)
+            n = max(0, min(40, int(f / 3.0 * 40)))
+            bar = "#" * n + "-" * (40 - n)
+            if f < 0.8:
+                tag = "GOOD  (earth-level)"
+            elif f < 1.5:
+                tag = "marginal"
+            else:
+                tag = "TOO CLOSE TO A MAGNET"
+            sys.stdout.write("\033[2A\r\033[2K |f| = %6.3f G  [%s]  %s\n" % (f, bar, tag))
+            sys.stdout.write("\033[2K   x=%+.3f y=%+.3f z=%+.3f   |   lowest seen = %.3f G\n"
+                             % (fx, fy, fz, mn))
+            sys.stdout.flush()
+            time.sleep(0.12)
+    except KeyboardInterrupt:
+        print("\nlowest |f| seen = %.3f G  (target ~%.2f G)" % (mn, EARTH))
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
