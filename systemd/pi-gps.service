@@ -1,0 +1,15 @@
+[Unit]
+Description=pi-gps: publish USB NMEA GPS position to /dev/shm/pi-gps
+After=local-fs.target
+
+[Service]
+Type=simple
+# User must be in the dialout group to read /dev/ttyACM* (no sudo needed).
+User=yuiseki
+ExecStart=/usr/local/bin/pi-gps
+Restart=always
+RestartSec=2
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

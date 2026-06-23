@@ -12,14 +12,17 @@ for f in "$here"/bin/*; do
     echo "  $name"
 done
 
-# Ensure i2c-dev is available and the invoking user can use it without sudo.
+# Let the invoking user reach the buses without sudo: i2c for the Qwiic
+# sensors, dialout for the USB GPS serial device.
 user="${SUDO_USER:-$USER}"
-if getent group i2c >/dev/null 2>&1; then
-    if ! id -nG "$user" | tr ' ' '\n' | grep -qx i2c; then
-        echo "Adding $user to the i2c group (log out/in for it to take effect) ..."
-        sudo usermod -aG i2c "$user"
+for grp in i2c dialout; do
+    if getent group "$grp" >/dev/null 2>&1; then
+        if ! id -nG "$user" | tr ' ' '\n' | grep -qx "$grp"; then
+            echo "Adding $user to the $grp group (log out/in for it to take effect) ..."
+            sudo usermod -aG "$grp" "$user"
+        fi
     fi
-fi
+done
 
 echo
 echo "Done. Quick check:"
@@ -28,3 +31,4 @@ echo "  pi-calib-mag          # live field strength, find a magnet-free spot"
 echo "  pi-calib              # tumble 30s -> ~/tmp/pi-calib.json"
 echo "  pi-orient             # publish orientation to /dev/shm/pi-orientation"
 echo "  pi-set-north / -south # set the bearing reference at the current facing"
+echo "  pi-gps                # publish USB GPS position to /dev/shm/pi-gps"

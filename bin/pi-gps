@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""pi-gps : read a USB NMEA GPS (e.g. u-blox 7) and publish position.
+
+Writes "<lat> <lon> <fix> <sats>" to /dev/shm/pi-gps (tmpfs = RAM, no microSD
+wear) on every GGA fix. fix is the NMEA quality (0=no fix, 1=GPS, 2=DGPS);
+lat/lon hold the last known position. Reads /dev/serial/by-id/*GPS* (falls back
+to /dev/ttyACM0); the user only needs to be in the dialout group (no sudo).
+Dependency-light: parses NMEA directly, no pyserial/gpsd. Ctrl-C to quit.
+
+Runs harmlessly with no GPS attached (keeps publishing fix=0) so a consumer can
+tell "no fix" from "no device".
+"""
+import os, sys, glob, time
+
+OUT = "/dev/shm/pi-gps"
+
+
+def find_dev():
+    for pat in ("*GPS*", "*GNSS*", "*u-blox*", "*u_blox*"):
+        g = sorted(glob.glob("/dev/serial/by-id/" + pat))
+        if g:
+            return g[0]
+    for c in ("/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyUSB0"):
+        if os.path.exists(c):
+            return c
+    return None
+
+
+def nmea_ok(line):
+    if len(line) < 4 or line[0] != "$" or "*" not in line:
+        return False
+    body, _, cks = line[1:].partition("*")
+    try:
+        want = int(cks[:2], 16)
+    except ValueError:
+        return False
+    x = 0
+    for ch in body:
+        x ^= ord(ch)
+    return x == want
+
+
+def dm_to_deg(val, hemi):
+    if not val:
+        return None
+    try:
+        f = float(val)
+    except ValueError:
+        return None
+    d = int(f / 100)
+    deg = d + (f - d * 100) / 60.0
+    return -deg if hemi in ("S", "W") else deg
+
+
+def publish(lat, lon, fix, sats):
+    tmp = OUT + ".tmp"
+    try:
+        with open(tmp, "w") as fh:
+            fh.write("%.6f %.6f %d %d\n" % (lat, lon, fix, sats))
+        os.replace(tmp, OUT)
+    except OSError:
+        pass
+
+
+def main():
+    tty = sys.stdout.isatty()
+    lat = lon = 0.0
+    fix = sats = 0
+    dev = find_dev()
+    print("pi-gps: %s -> %s%s"
+          % (dev or "no device", OUT, "   (Ctrl-C to quit)" if tty else ""))
+    if tty:
+        print("")
+        print("")
+    while True:
+        if not dev:
+            publish(lat, lon, 0, 0)
+            time.sleep(1.0)
+            dev = find_dev()
+            continue
+        try:
+            with open(dev, "r", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not nmea_ok(line):
+                        continue
+                    p = line.split(",")
+                    if p[0][3:] == "GGA" and len(p) >= 8:
+                        try:
+                            fix = int(p[6] or 0)
+                        except ValueError:
+                            fix = 0
+                        try:
+                            sats = int(p[7] or 0)
+                        except ValueError:
+                            sats = 0
+                        la, lo = dm_to_deg(p[2], p[3]), dm_to_deg(p[4], p[5])
+                        if la is not None and lo is not None:
+                            lat, lon = la, lo
+                        publish(lat, lon, fix, sats)
+                        if tty:
+                            sys.stdout.write(
+                                "\033[2A\r\033[2K fix=%d sats=%2d  lat=%.6f lon=%.6f\n"
+                                % (fix, sats, lat, lon))
+                            sys.stdout.write("\033[2K -> %s\n" % OUT)
+                            sys.stdout.flush()
+        except OSError as e:
+            if tty:
+                print("reopening serial (%s)" % e)
+            time.sleep(1.0)
+            dev = find_dev() or dev
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nbye")

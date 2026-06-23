@@ -1,8 +1,9 @@
 # pi-i2c-sensors
 
-Small, dependency-light tools for reading I2C / [Qwiic / STEMMA QT](https://www.sparkfun.com/qwiic)
-sensors on a Raspberry Pi, and turning them into something useful (right now: a
-tilt + compass orientation feed for a map/UI).
+Small, dependency-light tools for reading sensors on a Raspberry Pi and turning
+them into something useful (a tilt + compass orientation feed and a GPS position
+feed for a map/UI). Mostly I2C / [Qwiic / STEMMA QT](https://www.sparkfun.com/qwiic),
+plus a USB NMEA GPS (the repo name predates that one; it lives here anyway).
 
 Built and proven on a Pi 4 appliance (HDMI map display) with a Qwiic SHIM
 breaking out I2C1, but the tools are generic.
@@ -14,6 +15,7 @@ breaking out I2C1, but the tools are generic.
 | [SparkFun Qwiic SHIM](https://www.sparkfun.com/products/15794) | - | - | Breaks Pi I2C1 (GPIO2/3) out to Qwiic; daisy-chain sensors |
 | MSA311 3-axis accelerometer | `0x62` | `0x01` -> `0x13` | Bosch/MEMSIC; **powers up SUSPENDED** |
 | MMC5603 3-axis magnetometer | `0x30` | `0x39` -> `0x10` | MEMSIC; needs SET/RESET to null its offset |
+| u-blox 7 GPS/GNSS receiver | USB | - | USB CDC-ACM serial (`/dev/ttyACM0`), NMEA; not I2C |
 
 Multiple Qwiic sensors share the one I2C1 bus, so they coexist with anything
 else already on it (e.g. a PiSugar at `0x57`/`0x68`). `i2cdetect -y 1` lists them.
@@ -100,6 +102,15 @@ gravity automatically.
 restart. Prefer this 4-point fit; `pi-set-north`/`-south` remain a quick
 single-point fallback when the points are not present.
 
+### `pi-gps` - USB GPS position feed
+
+Reads a USB NMEA GPS (e.g. u-blox 7) at `/dev/serial/by-id/*GPS*` (falls back to
+`/dev/ttyACM0`) and publishes `<lat> <lon> <fix> <sats>` to `/dev/shm/pi-gps`
+(RAM). `fix` is the NMEA quality (0 = no fix, 1 = GPS, 2 = DGPS); lat/lon hold
+the last known position. Needs the **dialout** group (no sudo); parses NMEA
+directly (no gpsd/pyserial). Runs harmlessly with no GPS attached (keeps
+publishing `fix=0`). The map consumer recentres on the position when `fix >= 1`.
+
 ## Orientation pipeline
 
 ```
@@ -114,21 +125,21 @@ pi-orient (always running)  ->  /dev/shm/pi-orientation (RAM, ~15 Hz)
 Keep one-shot calibration on disk; keep the high-rate stream in `/dev/shm` so the
 microSD is never written in a hot loop.
 
-## Run `pi-orient` at boot (systemd)
+## Run the feeds at boot (systemd)
 
-So the orientation feed is always available:
+So the orientation + GPS feeds are always available:
 
 ```bash
-sudo cp systemd/pi-orient.service /etc/systemd/system/
-# the unit runs as User=yuiseki; edit it if your user differs
+sudo cp systemd/pi-orient.service systemd/pi-gps.service /etc/systemd/system/
+# the units run as User=yuiseki; edit if your user differs
 sudo systemctl daemon-reload
-sudo systemctl enable --now pi-orient.service
-systemctl status pi-orient.service
+sudo systemctl enable --now pi-orient.service pi-gps.service
+systemctl status pi-orient.service pi-gps.service
 ```
 
-`pi-orient` suppresses its live ANSI display when not on a terminal, so the
-journal stays clean. It re-probes for the sensors, so it survives the chips
-being absent or hot-plugged.
+Both suppress their live ANSI display when not on a terminal, so the journal
+stays clean, and both survive their device being absent or hot-plugged
+(re-probing / reopening), publishing a "no data" state meanwhile.
 
 ## Gotchas worth knowing
 
