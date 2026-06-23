@@ -60,7 +60,8 @@ def load_north():
         return 0.0
 
 
-CARD = ("north", "east", "south", "west")
+ALL_DIRS = ("north", "northeast", "east", "southeast",
+            "south", "southwest", "west", "northwest")
 
 
 def _solve_linear(A, b):
@@ -92,22 +93,25 @@ def _lsq3(M, y):
 
 
 def load_fit(plane):
-    """Affine heading calibration from the 4 pi-cal-point captures of a plane.
+    """Affine heading calibration from the pi-cal-point captures of a plane.
 
-    Needs pi-<plane>-{north,east,south,west}.json. Drops the near-constant
+    Uses every pi-<plane>-<dir>.json present (>=4 needed; the 4 diagonals, if
+    captured, sharpen the least-squares fit). Drops the near-constant
     (vertical) magnetometer axis, then least-squares fits an affine map of the
     two remaining axes to (cos, sin) of the true bearing -- correcting centre,
     per-axis scale, rotation and shear (needed e.g. when one horizontal axis is
     soft-iron compressed, as the mounted Z axis is). Returns a fit dict or None.
     """
     mags, trues = [], []
-    for d in CARD:
+    for d in ALL_DIRS:
         try:
             r = json.load(open(os.path.join(HOME, "tmp", "pi-%s-%s.json" % (plane, d))))
             mags.append(r["mag"])
             trues.append(math.radians(r["true_bearing"]))
         except Exception:
-            return None
+            continue                      # skip directions not captured yet
+    if len(mags) < 4:                     # need >= 4 points to fit the affine map
+        return None
     rng = [max(m[a] for m in mags) - min(m[a] for m in mags) for a in range(3)]
     drop = rng.index(min(rng))            # near-constant axis = vertical
     i, j = [a for a in range(3) if a != drop]

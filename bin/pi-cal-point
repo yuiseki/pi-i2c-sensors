@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""pi-cal-point <north|south|east|west> : capture a heading reference point.
+"""pi-cal-point <dir> : capture a heading reference point.
 
-Point the device at the named TRUE compass direction and run this. It reads the
-live calibrated magnetometer + accelerometer that pi-orient publishes to
+<dir> is a compass direction: north/east/south/west and the diagonals
+northeast/southeast/southwest/northwest (short aliases n/e/s/w/ne/se/sw/nw).
+
+Point the device at that TRUE direction and run this. It reads the live
+calibrated magnetometer + accelerometer that pi-orient publishes to
 /dev/shm/pi-orientation (so it touches no I2C and never fights pi-orient),
 auto-detects whether the device is HORIZONTAL or VERTICAL from gravity, and
 saves the reference to:
@@ -10,18 +13,23 @@ saves the reference to:
     ~/tmp/pi-h-<dir>.json   (device flat / horizontal)
     ~/tmp/pi-v-<dir>.json   (device upright / vertical)
 
-Collect north/south/east/west for a plane; a later fit step turns the four
-points into an accurate heading correction (offset + residual hard-iron).
+Capture at least the four cardinals for a plane; add the four diagonals for a
+more accurate fit. pi-orient uses whatever points are present.
 """
 import os, sys, json, time, pwd
 
-TRUE = {"north": 0.0, "east": 90.0, "south": 180.0, "west": 270.0}
+TRUE = {"north": 0.0, "northeast": 45.0, "east": 90.0, "southeast": 135.0,
+        "south": 180.0, "southwest": 225.0, "west": 270.0, "northwest": 315.0}
+ALIASES = {"n": "north", "ne": "northeast", "e": "east", "se": "southeast",
+           "s": "south", "sw": "southwest", "w": "west", "nw": "northwest"}
 SHM = "/dev/shm/pi-orientation"
 
-if len(sys.argv) != 2 or sys.argv[1] not in TRUE:
-    print("usage: pi-cal-point <north|south|east|west>")
+arg = sys.argv[1].lower() if len(sys.argv) == 2 else ""
+d = ALIASES.get(arg, arg)
+if d not in TRUE:
+    print("usage: pi-cal-point <north|northeast|east|southeast|south|southwest|west|northwest>")
+    print("       (aliases: n ne e se s sw w nw)")
     sys.exit(2)
-d = sys.argv[1]
 
 # Average several fresh samples for a steady reference.
 mx = my = mz = ax = ay = az = 0.0
