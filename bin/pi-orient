@@ -63,29 +63,68 @@ def load_north():
 CARD = ("north", "east", "south", "west")
 
 
-def load_hfit():
-    """4-point horizontal calibration from pi-cal-point captures.
+def _solve_linear(A, b):
+    """Gauss-Jordan solve of a 3x3 system. Returns len-3 list or None."""
+    n = 3
+    M = [[A[r][c] for c in range(n)] + [b[r]] for r in range(n)]
+    for col in range(n):
+        piv = max(range(col, n), key=lambda r: abs(M[r][col]))
+        if abs(M[piv][col]) < 1e-12:
+            return None
+        M[col], M[piv] = M[piv], M[col]
+        pv = M[col][col]
+        for c in range(col, n + 1):
+            M[col][c] /= pv
+        for r in range(n):
+            if r != col:
+                f = M[r][col]
+                for c in range(col, n + 1):
+                    M[r][c] -= f * M[col][c]
+    return [M[r][n] for r in range(n)]
 
-    Needs all of pi-h-{north,east,south,west}.json. Returns (cx, cy, off):
-    residual hard-iron centre (cx,cy) and a rotation offset (rad) such that
-    heading = atan2(my-cy, mx-cx) + off. Centring from the four cardinals fixes
-    the leftover hard-iron the tumble missed; off aligns sensor X to true North.
+
+def _lsq3(M, y):
+    """Least-squares fit of c so that M.c ~= y (M is Nx3) via normal equations."""
+    AtA = [[sum(M[k][r] * M[k][c] for k in range(len(M))) for c in range(3)]
+           for r in range(3)]
+    Aty = [sum(M[k][r] * y[k] for k in range(len(M))) for r in range(3)]
+    return _solve_linear(AtA, Aty)
+
+
+def load_fit(plane):
+    """Affine heading calibration from the 4 pi-cal-point captures of a plane.
+
+    Needs pi-<plane>-{north,east,south,west}.json. Drops the near-constant
+    (vertical) magnetometer axis, then least-squares fits an affine map of the
+    two remaining axes to (cos, sin) of the true bearing -- correcting centre,
+    per-axis scale, rotation and shear (needed e.g. when one horizontal axis is
+    soft-iron compressed, as the mounted Z axis is). Returns a fit dict or None.
     """
-    pts = []
+    mags, trues = [], []
     for d in CARD:
         try:
-            r = json.load(open(os.path.join(HOME, "tmp", "pi-h-%s.json" % d)))
-            pts.append((r["mag"][0], r["mag"][1], math.radians(r["true_bearing"])))
+            r = json.load(open(os.path.join(HOME, "tmp", "pi-%s-%s.json" % (plane, d))))
+            mags.append(r["mag"])
+            trues.append(math.radians(r["true_bearing"]))
         except Exception:
             return None
-    cx = sum(p[0] for p in pts) / len(pts)
-    cy = sum(p[1] for p in pts) / len(pts)
-    sx = sy = 0.0
-    for mx, my, tb in pts:
-        diff = tb - math.atan2(my - cy, mx - cx)
-        sx += math.cos(diff)
-        sy += math.sin(diff)
-    return (cx, cy, math.atan2(sy, sx))
+    rng = [max(m[a] for m in mags) - min(m[a] for m in mags) for a in range(3)]
+    drop = rng.index(min(rng))            # near-constant axis = vertical
+    i, j = [a for a in range(3) if a != drop]
+    M = [[m[i], m[j], 1.0] for m in mags]
+    cx = _lsq3(M, [math.cos(t) for t in trues])
+    cy = _lsq3(M, [math.sin(t) for t in trues])
+    if cx is None or cy is None:
+        return None
+    return {"axes": (i, j), "cx": cx, "cy": cy}
+
+
+def apply_fit(fit, mc):
+    i, j = fit["axes"]
+    u, v = mc[i], mc[j]
+    x = fit["cx"][0] * u + fit["cx"][1] * v + fit["cx"][2]
+    y = fit["cy"][0] * u + fit["cy"][1] * v + fit["cy"][2]
+    return math.degrees(math.atan2(y, x)) % 360.0
 
 
 def s16(lo, hi):
@@ -216,7 +255,8 @@ def main():
     last_probe = 0.0
     n = 0
     offset = load_north()
-    hfit = load_hfit()
+    hfit = load_fit("h")
+    vfit = load_fit("v")
     try:
         while True:
             n += 1
@@ -259,10 +299,13 @@ def main():
             # hard-iron centre + rotation offset; otherwise fall back to the raw
             # heading minus the pi-set-north offset.
             mx, my, mz = mc
-            if abs(az) >= 0.6 and hfit is not None:
-                cx, cy, foff = hfit
-                heading = math.degrees(math.atan2(my - cy, mx - cx) + foff) % 360
-            else:
+            # Horizontal (flat) uses the h-plane fit, upright uses the v-plane
+            # fit (gravity az picks which). Each affine fit already encodes the
+            # right two axes + scale + offset for that pose.
+            fit = hfit if abs(az) >= 0.6 else vfit
+            if fit is not None:
+                heading = apply_fit(fit, mc)
+            else:                           # no calibration yet: rough fallback
                 heading = (math.degrees(math.atan2(my, mx)) - offset) % 360
 
             pit = step_lin(pit, pitch_signed)
@@ -270,7 +313,8 @@ def main():
             if n % 25 == 0:                 # pick up pi-set-north changes live
                 offset = load_north()
             if n % 125 == 0:                # pick up new pi-cal-point captures
-                hfit = load_hfit()
+                hfit = load_fit("h")
+                vfit = load_fit("v")
             extra = " %.4f %.4f %.4f %.4f %.4f %.4f" % (mc[0], mc[1], mc[2], ax, ay, az)
             publish(pit, hdg, True, extra)
 

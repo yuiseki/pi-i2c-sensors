@@ -81,9 +81,13 @@ The accurate way to align the compass. Point the device at each TRUE cardinal
 direction (flat) and run it; it captures the live calibrated mag + accel from
 `/dev/shm/pi-orientation` (no I2C), auto-detects horizontal vs vertical from
 gravity, and saves `~/tmp/pi-h-<dir>.json` (or `pi-v-<dir>.json`). With all four
-horizontal points, `pi-orient` fits the residual hard-iron centre + a rotation
-offset, which corrects errors a single `pi-set-north` cannot (e.g. an
-off-centre, mildly elliptical horizontal circle left by an imperfect tumble).
+points of a plane, `pi-orient` least-squares fits an **affine map** (centre +
+per-axis scale + rotation + shear) of the two horizontal magnetometer axes to
+the true bearings. That corrects errors a single `pi-set-north` cannot, and
+handles the upright (vertical) case where one horizontal axis is the soft-iron
+compressed one (so a plain centre/offset is not enough). Capture both planes
+(`pi-h-*` flat, `pi-v-*` upright) and `pi-orient` picks the right fit from
+gravity automatically.
 
 ```bash
 # face true North (flat):  pi-cal-point north
