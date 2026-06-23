@@ -86,6 +86,22 @@ pi-orient (always running)  ->  /dev/shm/pi-orientation (RAM, ~15 Hz)
 Keep one-shot calibration on disk; keep the high-rate stream in `/dev/shm` so the
 microSD is never written in a hot loop.
 
+## Run `pi-orient` at boot (systemd)
+
+So the orientation feed is always available:
+
+```bash
+sudo cp systemd/pi-orient.service /etc/systemd/system/
+# the unit runs as User=yuiseki; edit it if your user differs
+sudo systemctl daemon-reload
+sudo systemctl enable --now pi-orient.service
+systemctl status pi-orient.service
+```
+
+`pi-orient` suppresses its live ANSI display when not on a terminal, so the
+journal stays clean. It re-probes for the sensors, so it survives the chips
+being absent or hot-plugged.
+
 ## Gotchas worth knowing
 
 These cost real debugging time; see [docs/chip-notes.md](docs/chip-notes.md) for

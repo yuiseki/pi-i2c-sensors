@@ -1,0 +1,15 @@
+[Unit]
+Description=pi-orient: publish I2C accel+mag orientation to /dev/shm/pi-orientation
+After=local-fs.target
+
+[Service]
+Type=simple
+# Run as a normal user that is in the i2c group (see install.sh) so no sudo is
+# needed and $HOME points at the user's ~/tmp/pi-calib.json.
+User=yuiseki
+ExecStart=/usr/local/bin/pi-orient
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

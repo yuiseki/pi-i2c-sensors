@@ -171,12 +171,14 @@ def main():
     have = probe(bus)
     if have:
         init_sensors(bus)
-    print("pi-orient -> %s   (Ctrl-C to quit)" % OUT)
-    print("sensors: %s   calibration: %s\n"
+    TTY = sys.stdout.isatty()   # suppress the live ANSI display under systemd
+    print("pi-orient -> %s%s" % (OUT, "   (Ctrl-C to quit)" if TTY else ""))
+    print("sensors: %s   calibration: %s"
           % ("present" if have else "ABSENT (publishing have=0)",
              "loaded" if os.path.exists(CALPATH) else "none (identity)"))
-    print("")
-    print("")
+    if TTY:
+        print("")
+        print("")
     hdg = None
     pit = None
     last_probe = 0.0
@@ -194,8 +196,9 @@ def main():
 
             if not have:
                 publish(0.0, 0.0, False)
-                sys.stdout.write("\033[2A\r\033[2K no sensors detected (have=0)\n\033[2K\n")
-                sys.stdout.flush()
+                if TTY:
+                    sys.stdout.write("\033[2A\r\033[2K no sensors detected (have=0)\n\033[2K\n")
+                    sys.stdout.flush()
                 time.sleep(0.25)
                 continue
 
@@ -233,10 +236,11 @@ def main():
             bout = (hdg - offset) % 360.0
             publish(pit, bout, True)
 
-            sys.stdout.write("\033[2A\r\033[2K TILT(pitch) = %5.1f deg   BEARING = %5.1f deg   (have=1)\n"
-                             % (pit, bout))
-            sys.stdout.write("\033[2K -> %s\n" % OUT)
-            sys.stdout.flush()
+            if TTY:
+                sys.stdout.write("\033[2A\r\033[2K TILT(pitch) = %5.1f deg   BEARING = %5.1f deg   (have=1)\n"
+                                 % (pit, bout))
+                sys.stdout.write("\033[2K -> %s\n" % OUT)
+                sys.stdout.flush()
             time.sleep(0.04)
     except KeyboardInterrupt:
         print("\n\nbye")
