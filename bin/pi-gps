@@ -8,8 +8,12 @@ is from GSV (useful while acquiring); lat/lon hold the last known position. Read
 to /dev/ttyACM0); the user only needs to be in the dialout group (no sudo).
 Dependency-light: parses NMEA directly, no pyserial/gpsd. Ctrl-C to quit.
 
-Runs harmlessly with no GPS attached (keeps publishing fix=0) so a consumer can
-tell "no fix" from "no device".
+Runs harmlessly with no GPS attached: while no device is present (or after an
+unplug / re-enumeration) it stops publishing, so /dev/shm/pi-gps goes stale.
+Consumers then distinguish states by freshness -- a stale file means "no GPS",
+a fresh fix=0 line means "device present, still acquiring", fix>=1 means a fix.
+The device is re-probed once a second, so hot-plugging a receiver is picked up
+automatically without a restart.
 """
 import os, sys, glob, time
 
@@ -75,9 +79,13 @@ def main():
         print("")
     while True:
         if not dev:
-            publish(lat, lon, 0, 0, 0)
+            # No device: stop publishing so /dev/shm/pi-gps goes stale and the
+            # consumer shows "no GPS" (distinct from a fresh fix=0 = acquiring).
+            # Re-probe every second so a hot-plugged receiver is picked up.
             time.sleep(1.0)
             dev = find_dev()
+            if dev:
+                print("pi-gps: %s -> %s" % (dev, OUT))
             continue
         try:
             with open(dev, "r", errors="ignore") as f:
@@ -113,11 +121,16 @@ def main():
                                 % (fix, sats, inview, lat, lon))
                             sys.stdout.write("\033[2K -> %s\n" % OUT)
                             sys.stdout.flush()
+            # Clean EOF: the port closed (typically an unplug). Drop it and
+            # let the no-device branch wait + re-probe.
+            dev = None
         except OSError as e:
+            # Device vanished (unplug / re-enumeration). Don't spin on the dead
+            # handle -- drop the stale path so the no-device branch waits and
+            # re-probes; a replugged receiver is then found automatically.
             if tty:
-                print("reopening serial (%s)" % e)
-            time.sleep(1.0)
-            dev = find_dev() or dev
+                print("pi-gps: device gone (%s); waiting..." % e)
+            dev = None
 
 
 if __name__ == "__main__":
