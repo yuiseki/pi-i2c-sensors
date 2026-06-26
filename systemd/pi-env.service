@@ -1,5 +1,5 @@
 [Unit]
-Description=pi-env: publish BME280 temp/humidity/pressure to /dev/shm/pi-env
+Description=pi-env: publish BME280 temp/humidity/pressure + VEML7700 lux to /dev/shm/pi-env
 After=local-fs.target
 
 [Service]

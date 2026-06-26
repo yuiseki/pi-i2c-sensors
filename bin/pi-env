@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
-"""pi-env : read a Bosch BME280 (temperature / humidity / pressure).
+"""pi-env : read environment sensors (Bosch BME280 + Vishay VEML7700).
 
-Default (no args): one-shot. Take a single forced measurement, print
-"<t> C  <h> %RH  <p> hPa", also publish it to /dev/shm/pi-env, and exit. A
-plain non-interactive CLI (no Ctrl-C needed).
+BME280 gives temperature / humidity / pressure (I2C 0x77 or 0x76).
+VEML7700 gives ambient light in lux (I2C 0x10). Either sensor may be absent;
+each is reported with its own presence flag.
 
---daemon (-d): keep measuring ~every 2 s and publishing for the map; used by
-the systemd unit.
+Default (no args): one-shot. Take a single measurement, print a human line,
+also publish to /dev/shm/pi-env, and exit. A plain non-interactive CLI.
 
-Published line: "<temp_c> <humidity_pct> <pressure_hpa> <have>" on /dev/shm
-(tmpfs = RAM). I2C 0x77 (or 0x76); i2c group, auto-sudo. Dependency-light:
-Bosch float compensation inlined, no driver libs. Harmless with no sensor.
+--daemon (-d): keep measuring ~every 2 s and publishing; used by the systemd
+unit.
+
+Published line on /dev/shm/pi-env (tmpfs = RAM):
+  "<temp_c> <humidity_pct> <pressure_hpa> <bme_have> <lux> <lux_have>"
+The first four fields are unchanged from the BME280-only version (so existing
+consumers keep working); lux + its presence flag are appended.
+
+i2c group, auto-sudo. Dependency-light: Bosch float compensation inlined and
+VEML7700 lux computed directly, no driver libs. Harmless with no sensors.
 """
 import os, sys, time
 
@@ -23,7 +30,8 @@ except ImportError:
         SMBus = None
 
 OUT = "/dev/shm/pi-env"
-ADDRS = (0x77, 0x76)
+ADDRS = (0x77, 0x76)        # BME280
+VEML_ADDR = 0x10            # VEML7700 ambient light
 
 
 def open_bus():
@@ -134,14 +142,70 @@ def measure_forced(bus, a, d):
     return measure(bus, a, d)
 
 
-def publish(t, h, p, have):
+# --- VEML7700 ambient light ------------------------------------------------
+# No chip-id register, so presence is "does 0x10 answer". Config reg 0x00 is a
+# 16-bit LSB-first word: bits[12:11]=gain, bits[9:6]=integration time, bit0=
+# shutdown. ALS data is reg 0x04. Lux = raw * resolution, where resolution
+# scales inversely with gain and integration time (0.0036 lx/count at the most
+# sensitive gain x2 / IT 800 ms). Auto-range: start wide (low gain, short IT)
+# and step up sensitivity only while the reading is small, so it stays accurate
+# from bright sunlight down to a dim room without saturating.
+#   gain bits: x1=0b00, x2=0b01, x1/8=0b10, x1/4=0b11
+#   IT bits:   100ms=0b0000, 200=0b0001, 400=0b0010, 800=0b0011, 50=0b1000, 25=0b1100
+VEML_SEQ = [
+    # (gain_bits, gain_factor, it_bits, it_ms)
+    (0b10, 0.125, 0b0000, 100),   # x1/8, 100 ms  (widest range)
+    (0b00, 1.0,   0b0000, 100),   # x1,   100 ms
+    (0b01, 2.0,   0b0000, 100),   # x2,   100 ms
+    (0b01, 2.0,   0b0001, 200),   # x2,   200 ms
+    (0b01, 2.0,   0b0011, 800),   # x2,   800 ms  (most sensitive)
+]
+
+
+def veml_present(bus):
+    if bus is None:
+        return False
+    try:
+        bus.read_word_data(VEML_ADDR, 0x00)
+        return True
+    except OSError:
+        return False
+
+
+def veml_read_lux(bus):
+    """Auto-ranged ambient light in lux (raises OSError if the sensor goes)."""
+    raw = 0
+    res = 0.0
+    for gain_bits, gf, it_bits, it_ms in VEML_SEQ:
+        conf = (gain_bits << 11) | (it_bits << 6)   # PERS/INT/SD = 0 (ALS on)
+        bus.write_word_data(VEML_ADDR, 0x00, conf)
+        time.sleep(it_ms / 1000.0 + 0.05)           # wait past one integration
+        raw = bus.read_word_data(VEML_ADDR, 0x04)
+        res = 0.0036 * (2.0 / gf) * (800.0 / it_ms)
+        if raw > 100:                                # enough signal here
+            break
+    return raw * res
+
+
+def publish(t, h, p, have, lux, lux_have):
     tmp = OUT + ".tmp"
     try:
         with open(tmp, "w") as fh:
-            fh.write("%.2f %.1f %.1f %d\n" % (t, h, p, 1 if have else 0))
+            fh.write("%.2f %.1f %.1f %d %.1f %d\n"
+                     % (t, h, p, 1 if have else 0, lux, 1 if lux_have else 0))
         os.replace(tmp, OUT)
     except OSError:
         pass
+
+
+def read_lux(bus):
+    """Return (lux, present). Never raises."""
+    try:
+        if veml_present(bus):
+            return veml_read_lux(bus), True
+    except OSError:
+        pass
+    return 0.0, False
 
 
 def main():
@@ -157,34 +221,45 @@ def main():
         d = read_calib(bus, a)
 
     if not daemon:
-        if a is None:
-            publish(0.0, 0.0, 0.0, False)
-            print("no BME280 found (looked at 0x77 / 0x76)", file=sys.stderr)
+        lux, lux_have = read_lux(bus)
+        if a is None and not lux_have:
+            publish(0.0, 0.0, 0.0, False, 0.0, False)
+            print("no BME280 (0x77/0x76) or VEML7700 (0x10) found",
+                  file=sys.stderr)
             return 1
-        t, h, p = measure_forced(bus, a, d)
-        publish(t, h, p, True)
-        print("%.1f C   %.0f %%RH   %.1f hPa" % (t, h, p))
+        if a is not None:
+            t, h, p = measure_forced(bus, a, d)
+        else:
+            t = h = p = 0.0
+        publish(t, h, p, a is not None, lux, lux_have)
+        parts = []
+        if a is not None:
+            parts.append("%.1f C   %.0f %%RH   %.1f hPa" % (t, h, p))
+        if lux_have:
+            parts.append("%.1f lux" % lux)
+        print("   ".join(parts))
         return 0
 
     n = 0
     while True:
         n += 1
         if a is None:
-            publish(0.0, 0.0, 0.0, False)
             if n % 5 == 0:
                 bus = bus or open_bus()
                 a = find(bus)
                 if a is not None:
                     configure(bus, a)
                     d = read_calib(bus, a)
-            time.sleep(1.0)
-            continue
-        try:
-            t, h, p = measure_forced(bus, a, d)
-        except OSError:
-            a = None
-            continue
-        publish(t, h, p, True)
+        if a is not None:
+            try:
+                t, h, p = measure_forced(bus, a, d)
+            except OSError:
+                a = None
+                t = h = p = 0.0
+        else:
+            t = h = p = 0.0
+        lux, lux_have = read_lux(bus)
+        publish(t, h, p, a is not None, lux, lux_have)
         time.sleep(2.0)
 
 

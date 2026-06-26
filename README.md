@@ -17,6 +17,7 @@ breaking out I2C1, but the tools are generic.
 | MMC5603 3-axis magnetometer | `0x30` | `0x39` -> `0x10` | MEMSIC; needs SET/RESET to null its offset |
 | u-blox 7 GPS/GNSS receiver | USB | - | USB CDC-ACM serial (`/dev/ttyACM0`), NMEA; not I2C |
 | BME280 temp/humidity/pressure | `0x77` (`0x76`) | `0xD0` -> `0x60` | Bosch; pressure is fine close to the Pi, but T/RH read hot (place it away for ambient) |
+| VEML7700 ambient light | `0x10` | (no chip id) | Vishay; lux via auto-ranged gain/IT. Read by `pi-env` alongside the BME280 |
 
 Multiple Qwiic sensors share the one I2C1 bus, so they coexist with anything
 else already on it (e.g. a PiSugar at `0x57`/`0x68`). `i2cdetect -y 1` lists them.
@@ -112,12 +113,21 @@ the last known position. Needs the **dialout** group (no sudo); parses NMEA
 directly (no gpsd/pyserial). Runs harmlessly with no GPS attached (keeps
 publishing `fix=0`). The map consumer recentres on the position when `fix >= 1`.
 
-### `pi-env` - BME280 environment (temp / humidity / pressure)
+### `pi-env` - environment (BME280 temp / humidity / pressure + VEML7700 lux)
 
-One-shot by default: `pi-env` prints `27.5 C  45 %RH  1010.5 hPa`, also writes
-`<temp_c> <humidity_pct> <pressure_hpa> <have>` to `/dev/shm/pi-env`, and exits
-(a plain non-interactive CLI). `pi-env --daemon` keeps measuring ~every 2 s for
-a consumer (systemd unit). Bosch float compensation is inlined (no driver libs).
+One-shot by default: `pi-env` prints `27.5 C  45 %RH  1010.5 hPa  230.1 lux`,
+also writes `<temp_c> <humidity_pct> <pressure_hpa> <bme_have> <lux> <lux_have>`
+to `/dev/shm/pi-env`, and exits (a plain non-interactive CLI). `pi-env --daemon`
+keeps measuring ~every 2 s for a consumer (systemd unit). Bosch float
+compensation is inlined and VEML7700 lux is computed directly (no driver libs).
+
+Both sensors are optional and independent: each is reported with its own
+presence flag, so the BME280 and the VEML7700 (light) can be used separately or
+together. The first four fields are unchanged from the BME280-only version, so
+existing consumers keep working; lux is appended. Light is auto-ranged (gain /
+integration time stepped so it stays accurate from bright sun to a dim room).
+Rationale for folding lux into `pi-env` rather than a separate `pi-lux`: avoids
+one-command-per-chip sprawl (YAGNI); `pi-env` is the single "ambient" reader.
 
 Placement matters: the **pressure** reading is accurate even right next to the
 Pi, but **temperature/humidity read hot** there (the Pi's heat). For ambient

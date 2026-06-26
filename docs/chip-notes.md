@@ -80,3 +80,24 @@ heading = atan2(Yh, Xh)
 If the Z axis is unreliable (soft-iron), drop to the flat heading
 `atan2(my, mx)`; it is exact only when level but good enough at small tilt and
 far better than a garbage tilt-comp.
+
+## VEML7700 (ambient light, I2C 0x10)
+
+- **No chip-id / who-am-I register.** Detect by whether `0x10` answers a read
+  of config reg `0x00`. Read by `pi-env`.
+- Registers are 16-bit **LSB-first words** (use SMBus word ops directly):
+  - `0x00` ALS_CONF_0 (config): bits `[12:11]`=gain, `[9:6]`=integration time
+    (IT), `[5:4]`=persistence, `[1]`=INT enable, `[0]`=**ALS_SD (shutdown)**.
+  - `0x04` ALS (the light channel used for lux), `0x05` WHITE.
+- **Boots shut down** (`0x00` reads `0x0001` = ALS_SD set). Clear bit0 to enable;
+  wait one integration time before the first valid read.
+- Gain bits: x1=`0b00`, x2=`0b01`, x1/8=`0b10`, x1/4=`0b11`.
+  IT bits: 100ms=`0b0000`, 200=`0b0001`, 400=`0b0010`, 800=`0b0011`, 50=`0b1000`,
+  25=`0b1100`.
+- **Lux = raw x resolution**, where `resolution = 0.0036 * (2/gain) * (800/IT_ms)`
+  lux/count (0.0036 is the max-resolution figure at gain x2 / IT 800 ms; verified
+  it gives the datasheet 0.0576 at gain x1 / IT 100 ms).
+- **Auto-range** (what `pi-env` does): start wide (gain x1/8, IT 100 ms) and step
+  up sensitivity only while `raw <= 100`, so it never saturates in sun yet keeps
+  resolution in a dim room. The high-lux nonlinearity polynomial is skipped
+  (overkill for an environment reading).
