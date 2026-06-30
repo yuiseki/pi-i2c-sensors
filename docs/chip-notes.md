@@ -83,6 +83,11 @@ far better than a garbage tilt-comp.
 
 ## VEML7700 (ambient light, I2C 0x10)
 
+- **Breakouts are interchangeable.** The Adafruit STEMMA QT VEML7700
+  (Switch Science 8182) and the SparkFun Qwiic VEML7700 (SS 10600) carry the
+  same VEML7700 at the same address `0x10`, so swapping one for the other is a
+  drop-in: no code, no address change. Verified on pi4-s-1 (2026-06-30) — the
+  new board read 20/20 and tracked dark (~8 lux covered) to bright (~100+ lux).
 - **No chip-id / who-am-I register.** Detect by whether `0x10` answers a read
   of config reg `0x00`. Read by `pi-env`.
 - Registers are 16-bit **LSB-first words** (use SMBus word ops directly):
@@ -101,3 +106,40 @@ far better than a garbage tilt-comp.
   up sensitivity only while `raw <= 100`, so it never saturates in sun yet keeps
   resolution in a dim room. The high-lux nonlinearity polynomial is skipped
   (overkill for an environment reading).
+
+## Qwiic daisy-chain: swapping a board (and the reseat trap)
+
+Replacing one sensor on a Qwiic chain (e.g. swap the VEML7700 board) routinely
+jostles the connector of the *next* sensor on the chain. On pi4-s-1 a VEML7700
+swap left the chained BME280 (0x77) reading errors while the VEML7700 itself was
+perfect — the fault was purely the `VEML -> BME280` cable segment, not the new
+board.
+
+- **Symptom of a marginal Qwiic contact: ACK-but-can't-read.** A barely-seated
+  connector still ACKs the 1-byte address probe but fails longer transfers with
+  `OSError: [Errno 5] Input/output error`. Reads can also flap (a few good ones,
+  then a stretch of failures) as the contact shifts. `i2cdetect` is unreliable
+  here both ways: it may *show* the address (probe ACKs) when reads fail, and for
+  the BME280 at 0x77 it often does **not** show it (i2cdetect's default
+  quick-write probe gets NAKed) even when register reads work fine. **Trust a
+  real register read, not i2cdetect**, especially for 0x77.
+- **Quantify with a trial loop, don't eyeball one read.** Loop each device ~20x
+  and count successes; a healthy device is 20/20, a bad contact is 0/20 (or
+  flapping). This also isolates the bad chain segment: if the swapped sensor is
+  20/20 while its neighbour is 0/20, the `Pi -> swapped` part is fine and only the
+  `swapped -> neighbour` segment is loose.
+  ```python
+  def trials(fn, n=20):
+      ok = 0
+      for _ in range(n):
+          try: fn(); ok += 1
+          except Exception: pass
+      return ok
+  trials(lambda: b.read_byte_data(0x77, 0xD0))      # BME280 chip-id (->0x60)
+  trials(lambda: b.read_i2c_block_data(0x77, 0xE1, 7))  # BME280 calib block
+  trials(lambda: b.read_word_data(0x10, 0x04))      # VEML7700 ALS
+  ```
+- **Fix:** firmly reseat the neighbour's Qwiic cable at *both* ends (click home);
+  if still 0/20, swap that cable (intermittent break) or move to the spare
+  connector on the new board (these boards have two). Re-run the trial loop;
+  expect 20/20 on every device before declaring done.
