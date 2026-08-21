@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""pi-power - report the UPS/battery state of a Raspberry Pi.
+
+Two power boards are supported and picked automatically:
+
+  x120x    Geekworm/SupTronics X120x (X1200/X1201/X1202) UPS HAT. The
+           `x120x` kernel driver (dtoverlay=x120x) exposes the pack through
+           the standard power_supply class, so this is a plain sysfs read -
+           no I2C access and no root needed.
+  pisugar  PiSugar 2/3. pisugar-server speaks a line protocol on TCP 8423.
+
+The output is the same for both, and is the same three lines the original
+PiSugar-only shell version printed, because the map app parses them:
+
+    battery: 94
+    battery_v: 4.1725
+    battery_power_plugged: true
+
+Environment overrides (used by the tests, handy for debugging):
+    PI_POWER_SYSFS      sysfs root, default /sys
+    PI_POWER_PISUGAR    host:port of pisugar-server, default 127.0.0.1:8423
+"""
+import argparse
+import os
+import socket
+import sys
+from pathlib import Path
+
+SYSFS = Path(os.environ.get("PI_POWER_SYSFS", "/sys"))
+PISUGAR = os.environ.get("PI_POWER_PISUGAR", "127.0.0.1:8423")
+
+# The x120x driver names its power_supply nodes after the board.
+X120X_BATTERY = "x120x-battery"
+X120X_AC = "x120x-ac"
+
+
+class Unavailable(Exception):
+    """The backend this was asked for is not on this machine."""
+
+
+def _read(path):
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return None
+
+
+def _read_int(path):
+    raw = _read(path)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def read_x120x():
+    """Read the X120x pack out of /sys/class/power_supply."""
+    ps = SYSFS / "class" / "power_supply"
+    battery = ps / X120X_BATTERY
+    if not battery.is_dir():
+        raise Unavailable(
+            "no %s under %s - is dtoverlay=x120x in config.txt?" % (X120X_BATTERY, ps)
+        )
+
+    percent = _read_int(battery / "capacity")
+    if percent is None:
+        # Some builds expose only the coulomb counters; derive the same number.
+        now = _read_int(battery / "charge_now")
+        full = _read_int(battery / "charge_full")
+        if now is None or not full:
+            raise Unavailable("%s reports neither capacity nor charge_now/full" % battery)
+        percent = round(now * 100 / full)
+
+    micro_volts = _read_int(battery / "voltage_now")
+    volts = micro_volts / 1e6 if micro_volts is not None else None
+
+    online = _read_int(ps / X120X_AC / "online")
+    if online is None:
+        # No AC node (or unreadable): the pack's own status still tells us
+        # whether something is feeding it.
+        online = 1 if (_read(battery / "status") or "") in ("Charging", "Full") else 0
+
+    return percent, volts, bool(online)
+
+
+def read_pisugar():
+    """Ask pisugar-server for the same three values over TCP."""
+    host, _, port = PISUGAR.partition(":")
+    addr = (host, int(port or 8423))
+
+    def query(key):
+        try:
+            with socket.create_connection(addr, timeout=2) as sock:
+                sock.sendall(("get %s\n" % key).encode())
+                reply = sock.recv(256).decode()
+        except OSError as exc:
+            raise Unavailable("pisugar-server at %s: %s" % (PISUGAR, exc))
+        # Replies look like "battery: 100".
+        for line in reply.splitlines():
+            name, sep, value = line.partition(":")
+            if sep and name.strip() == key:
+                return value.strip()
+        raise Unavailable("pisugar-server gave no %s (said %r)" % (key, reply))
+
+    percent = query("battery")
+    volts = query("battery_v")
+    plugged = query("battery_power_plugged").lower() == "true"
+    return percent, volts, plugged
+
+
+BACKENDS = {"x120x": read_x120x, "pisugar": read_pisugar}
+# x120x first: it is a local sysfs read, so probing it is free and cannot hang.
+ORDER = ("x120x", "pisugar")
+
+
+def detect(preferred="auto"):
+    """Return (name, percent, volts, plugged) for the first backend that answers."""
+    names = ORDER if preferred == "auto" else (preferred,)
+    reasons = []
+    for name in names:
+        try:
+            return (name, *BACKENDS[name]())
+        except Unavailable as exc:
+            reasons.append("%s: %s" % (name, exc))
+    raise Unavailable("no power backend responded\n  " + "\n  ".join(reasons))
+
+
+def format_volts(volts):
+    """Match the PiSugar output: a bare number, no trailing-zero padding."""
+    if volts is None:
+        return "unknown"
+    if isinstance(volts, str):
+        return volts
+    return ("%.4f" % volts).rstrip("0").rstrip(".")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--backend", choices=("auto", *ORDER), default="auto",
+        help="force a backend instead of auto-detecting (default: auto)")
+    parser.add_argument(
+        "--which", action="store_true",
+        help="print only the name of the backend in use")
+    args = parser.parse_args()
+
+    try:
+        name, percent, volts, plugged = detect(args.backend)
+    except Unavailable as exc:
+        print("pi-power: %s" % exc, file=sys.stderr)
+        return 1
+
+    if args.which:
+        print(name)
+        return 0
+
+    print("battery: %s" % percent)
+    print("battery_v: %s" % format_volts(volts))
+    print("battery_power_plugged: %s" % ("true" if plugged else "false"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -18,9 +18,14 @@ breaking out I2C1, but the tools are generic.
 | u-blox 7 GPS/GNSS receiver | USB | - | USB CDC-ACM serial (`/dev/ttyACM0`), NMEA; not I2C |
 | BME280 temp/humidity/pressure | `0x77` (`0x76`) | `0xD0` -> `0x60` | Bosch; pressure is fine close to the Pi, but T/RH read hot (place it away for ambient) |
 | VEML7700 ambient light | `0x10` | (no chip id) | Vishay; lux via auto-ranged gain/IT. Read by `pi-env` alongside the BME280 |
+| [Geekworm X120x UPS HAT](https://wiki.geekworm.com/X1201) (X1200/X1201/X1202) | `0x36` | - | Read through the `x120x` kernel driver, not raw I2C; needs `dtoverlay=x120x` |
 
 Multiple Qwiic sensors share the one I2C1 bus, so they coexist with anything
 else already on it (e.g. a PiSugar at `0x57`/`0x68`). `i2cdetect -y 1` lists them.
+
+A battery board sits on the same bus. `i2cdetect` shows a PiSugar directly,
+but an X120x's gauge is claimed by the `x120x` driver, so it shows up under
+`/sys/class/power_supply/` instead of as a free address.
 
 ## Install
 
@@ -32,6 +37,13 @@ else already on it (e.g. a PiSugar at `0x57`/`0x68`). `i2cdetect -y 1` lists the
 `/dev/i2c-1` is `root:i2c`, so the tools need either i2c-group membership (what
 install.sh sets up) or sudo. They auto-elevate with `sudo` if they hit a
 permission error, so they work either way.
+
+The tests are stdlib-only and need no hardware (both `pi-power` backends are
+faked), so they run anywhere:
+
+```bash
+python3 -m unittest discover -s tests
+```
 
 ## Tools
 
@@ -133,6 +145,33 @@ Placement matters: the **pressure** reading is accurate even right next to the
 Pi, but **temperature/humidity read hot** there (the Pi's heat). For ambient
 T/RH put the sensor on a Qwiic cable away from the Pi (the dew point of the hot
 reading matches the room, confirming it is the same air measured warm).
+
+### `pi-power` - UPS / battery state
+
+One-shot, no arguments, works on either supported power board:
+
+```
+$ pi-power
+battery: 94
+battery_v: 4.1725
+battery_power_plugged: true
+```
+
+The backend is detected, not configured:
+
+| Backend | Board | How it reads |
+|---|---|---|
+| `x120x` | Geekworm/SupTronics X1200/X1201/X1202 | `/sys/class/power_supply/x120x-{battery,ac}` via the `x120x` kernel driver |
+| `pisugar` | PiSugar 2/3 | pisugar-server's line protocol on TCP 8423 |
+
+`x120x` is probed first because it is a local sysfs read that cannot block, and
+it needs neither root nor i2c-group membership. Use `--backend` to pin one (it
+then fails instead of falling back, which is what you want in a script) and
+`--which` to print just the backend name.
+
+The three output lines are the contract: the map app's status bar parses them,
+so they stay the same across boards. A value that cannot be read prints as
+`unknown` rather than vanishing.
 
 ## Orientation pipeline
 
