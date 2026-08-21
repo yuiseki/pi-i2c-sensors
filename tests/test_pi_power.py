@@ -17,6 +17,19 @@ REPO = Path(__file__).resolve().parent.parent
 PI_POWER = REPO / "bin" / "pi-power"
 
 
+def load_module():
+    """Import bin/pi-power, which has no .py suffix."""
+    import importlib.util
+    spec = importlib.util.spec_from_loader(
+        "pi_power", importlib.machinery.SourceFileLoader("pi_power", str(PI_POWER)))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+import importlib.machinery  # noqa: E402
+
+
 def run(env_extra, args=()):
     env = dict(os.environ)
     # Never let a real PiSugar (or a real /sys) leak into a test.
@@ -161,6 +174,103 @@ class Selection(unittest.TestCase):
         r = run({"PI_POWER_SYSFS": str(root)}, ["--which"])
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(), "x120x")
+    def test_dry_run_reports_without_halting(self):
+        root = make_sysfs(battery={"capacity": 1, "voltage_now": 3300000},
+                          ac={"online": 0})
+        r = run({"PI_POWER_SYSFS": str(root)},
+                ["--daemon", "--dry-run", "--dwell", "0", "--interval", "0.05",
+                 "--exit-after", "0.4"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("would shut down", r.stderr.lower())
+
+    def test_daemon_publishes_to_shm_path(self):
+        root = make_sysfs(battery={"capacity": 55, "voltage_now": 3900000},
+                          ac={"online": 1})
+        out = Path(tempfile.mkdtemp()) / "pi-power"
+        r = run({"PI_POWER_SYSFS": str(root), "PI_POWER_PUBLISH": str(out)},
+                ["--daemon", "--interval", "0.05", "--exit-after", "0.2"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(out.read_text().split(), ["55", "3.9", "1", "1"])
+
+
+class GuardPolicy(unittest.TestCase):
+    """The low-battery policy: warn at 10%, shut down at 3%, only on battery,
+    and only once the level has stayed there continuously."""
+
+    WARN, CRIT, DWELL, REPEAT = 10, 3, 60, 300
+
+    def setUp(self):
+        self.mod = load_module()
+        self.warned = []
+        self.halted = []
+        self.guard = self.mod.Guard(
+            warn_pct=self.WARN, crit_pct=self.CRIT,
+            dwell_s=self.DWELL, repeat_s=self.REPEAT,
+            on_warn=self.warned.append, on_shutdown=self.halted.append,
+        )
+
+    def feed(self, samples):
+        """samples: (t, percent, plugged) tuples."""
+        for t, pct, plugged in samples:
+            self.guard.step(t, pct, plugged)
+
+    def test_on_ac_nothing_happens_however_low(self):
+        self.feed([(t, 1, True) for t in range(0, 1000, 10)])
+        self.assertEqual(self.warned, [])
+        self.assertEqual(self.halted, [])
+
+    def test_warn_waits_for_the_dwell_to_elapse(self):
+        self.feed([(t, 9, False) for t in range(0, self.DWELL, 10)])
+        self.assertEqual(self.warned, [], "warned before the dwell elapsed")
+        self.feed([(self.DWELL, 9, False)])
+        self.assertEqual(self.warned, [9])
+
+    def test_warn_repeats_only_after_the_repeat_interval(self):
+        self.feed([(t, 9, False) for t in range(0, self.DWELL + 1, 10)])
+        self.assertEqual(len(self.warned), 1)
+        self.feed([(t, 9, False) for t in range(self.DWELL, self.DWELL + self.REPEAT, 10)])
+        self.assertEqual(len(self.warned), 1, "warned again too soon")
+        self.feed([(self.DWELL + self.REPEAT, 9, False)])
+        self.assertEqual(len(self.warned), 2)
+
+    def test_recovering_above_the_threshold_rearms_the_dwell(self):
+        self.feed([(t, 9, False) for t in range(0, self.DWELL, 10)])
+        self.feed([(self.DWELL, 20, False)])            # back up
+        self.feed([(self.DWELL + 10, 9, False)])        # down again
+        self.assertEqual(self.warned, [], "the old dwell was reused")
+        self.feed([(self.DWELL + 10 + self.DWELL, 9, False)])
+        self.assertEqual(self.warned, [9])
+
+    def test_reconnecting_ac_clears_a_pending_warning(self):
+        self.feed([(t, 9, False) for t in range(0, self.DWELL, 10)])
+        self.feed([(self.DWELL, 9, True)])              # plugged back in
+        self.feed([(self.DWELL + 10, 9, False)])        # unplugged again
+        self.assertEqual(self.warned, [])
+
+    def test_shutdown_after_a_sustained_critical_level(self):
+        self.feed([(t, 2, False) for t in range(0, self.DWELL, 10)])
+        self.assertEqual(self.halted, [], "shut down before the dwell elapsed")
+        self.feed([(self.DWELL, 2, False)])
+        self.assertEqual(self.halted, [2])
+
+    def test_critical_also_warns(self):
+        # 2% is below both thresholds; the user should hear about it as well.
+        self.feed([(t, 2, False) for t in range(0, self.DWELL + 1, 10)])
+        self.assertEqual(self.warned, [2])
+
+    def test_shutdown_fires_once(self):
+        self.feed([(t, 2, False) for t in range(0, 1000, 10)])
+        self.assertEqual(len(self.halted), 1)
+
+    def test_a_brief_dip_to_critical_does_not_shut_down(self):
+        self.feed([(0, 2, False), (10, 2, False), (20, 30, False)])
+        self.feed([(t, 30, False) for t in range(30, 400, 10)])
+        self.assertEqual(self.halted, [])
+
+    def test_unknown_percent_is_ignored_not_treated_as_zero(self):
+        self.feed([(t, None, False) for t in range(0, 400, 10)])
+        self.assertEqual(self.warned, [])
+        self.assertEqual(self.halted, [])
 
 
 if __name__ == "__main__":

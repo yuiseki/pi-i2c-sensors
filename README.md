@@ -173,6 +173,33 @@ The three output lines are the contract: the map app's status bar parses them,
 so they stay the same across boards. A value that cannot be read prints as
 `unknown` rather than vanishing.
 
+#### `pi-power --daemon` - publish + low-battery policy
+
+Keeps polling, writes `<percent> <volts> <plugged> <have>` to
+**`/dev/shm/pi-power`** for other processes, and enforces a policy:
+
+| Level | Default | Action |
+|---|---|---|
+| warn | `--warn 10` | `wall` a warning to every terminal, repeated every `--repeat 300` s |
+| critical | `--crit 3` | `systemctl poweroff` |
+
+Two conditions guard both actions, because an appliance that halts itself for
+no good reason is worse than one that runs the pack flat:
+
+- **only on battery.** Anything while AC is present is somebody else's problem,
+  and a gauge can read oddly mid-charge.
+- **only when it lasts.** The level has to stay at or below the threshold
+  continuously for `--dwell 60` s. Reconnecting AC, or the level coming back
+  up, re-arms the wait from scratch, so a momentary dip under load cannot halt
+  the Pi. A backend that disappears mid-run is treated as "no reading", never
+  as 0%.
+
+`--dry-run` says what it would do instead of shutting down - use it to watch
+the policy work without losing the machine.
+
+Install it as a service with `systemd/pi-power.service`. It runs as root
+because the shutdown and `wall` need to; the reads themselves do not.
+
 ## Orientation pipeline
 
 ```
@@ -192,15 +219,18 @@ microSD is never written in a hot loop.
 So the orientation + GPS feeds are always available:
 
 ```bash
-sudo cp systemd/pi-orient.service systemd/pi-gps.service systemd/pi-env.service /etc/systemd/system/
-# the units run as User=yuiseki; edit if your user differs
+sudo cp systemd/pi-orient.service systemd/pi-gps.service systemd/pi-env.service \
+        systemd/pi-power.service /etc/systemd/system/
+# the sensor units run as User=yuiseki; edit if your user differs
 sudo systemctl daemon-reload
-sudo systemctl enable --now pi-orient.service pi-gps.service pi-env.service
-systemctl status pi-orient.service pi-gps.service pi-env.service
+sudo systemctl enable --now pi-orient.service pi-gps.service pi-env.service \
+        pi-power.service
+systemctl status pi-orient.service pi-gps.service pi-env.service pi-power.service
 ```
 
-(`pi-env` needs `--daemon`, which its unit already passes; the bare command is a
-one-shot CLI.)
+(`pi-env` and `pi-power` need `--daemon`, which their units already pass; the
+bare commands are one-shot CLIs. `pi-power.service` is the exception to
+`User=yuiseki`: it stays root so it can actually shut the machine down.)
 
 Both suppress their live ANSI display when not on a terminal, so the journal
 stays clean, and both survive their device being absent or hot-plugged

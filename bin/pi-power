@@ -16,6 +16,11 @@ PiSugar-only shell version printed, because the map app parses them:
     battery_v: 4.1725
     battery_power_plugged: true
 
+`--daemon` keeps reading, publishes the same numbers to /dev/shm/pi-power for
+other processes, and enforces a low-battery policy: warn on the console, then
+shut down. Both only ever fire while the pack is actually on battery, and only
+after the level has stayed low continuously - a single dip cannot halt the Pi.
+
 Environment overrides (used by the tests, handy for debugging):
     PI_POWER_SYSFS      sysfs root, default /sys
     PI_POWER_PISUGAR    host:port of pisugar-server, default 127.0.0.1:8423
@@ -23,7 +28,9 @@ Environment overrides (used by the tests, handy for debugging):
 import argparse
 import os
 import socket
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 SYSFS = Path(os.environ.get("PI_POWER_SYSFS", "/sys"))
@@ -32,6 +39,10 @@ PISUGAR = os.environ.get("PI_POWER_PISUGAR", "127.0.0.1:8423")
 # The x120x driver names its power_supply nodes after the board.
 X120X_BATTERY = "x120x-battery"
 X120X_AC = "x120x-ac"
+
+# Where --daemon publishes, matching the other feeds in this repo.
+# tmpfs, so a once-a-poll write costs the microSD nothing.
+PUBLISH = Path(os.environ.get("PI_POWER_PUBLISH", "/dev/shm/pi-power"))
 
 
 class Unavailable(Exception):
@@ -125,6 +136,122 @@ def detect(preferred="auto"):
     raise Unavailable("no power backend responded\n  " + "\n  ".join(reasons))
 
 
+class Guard:
+    """The low-battery policy, kept free of I/O so it can be tested directly.
+
+    Both actions are edge-triggered on "has been this low, on battery, for a
+    while": the level has to stay at or below the threshold continuously for
+    `dwell_s`. Charging, or the level coming back up, re-arms the wait from
+    scratch. A shutdown latches - there is nothing sensible to do twice.
+    """
+
+    def __init__(self, warn_pct, crit_pct, dwell_s, repeat_s, on_warn, on_shutdown):
+        self.warn_pct = warn_pct
+        self.crit_pct = crit_pct
+        self.dwell_s = dwell_s
+        self.repeat_s = repeat_s
+        self.on_warn = on_warn
+        self.on_shutdown = on_shutdown
+        self.warn_since = None
+        self.crit_since = None
+        self.warned_at = None
+        self.halted = False
+
+    def _reset(self):
+        self.warn_since = None
+        self.crit_since = None
+        self.warned_at = None
+
+    def step(self, now, percent, plugged):
+        # On mains, or with no reading at all, there is no policy to enforce.
+        if plugged or percent is None:
+            self._reset()
+            return
+
+        if percent <= self.warn_pct:
+            if self.warn_since is None:
+                self.warn_since = now
+            elif now - self.warn_since >= self.dwell_s and (
+                self.warned_at is None or now - self.warned_at >= self.repeat_s
+            ):
+                self.warned_at = now
+                self.on_warn(percent)
+        else:
+            self.warn_since = None
+            self.warned_at = None
+
+        if percent <= self.crit_pct:
+            if self.crit_since is None:
+                self.crit_since = now
+            elif now - self.crit_since >= self.dwell_s and not self.halted:
+                self.halted = True
+                self.on_shutdown(percent)
+        else:
+            self.crit_since = None
+
+
+def publish(percent, volts, plugged):
+    """Write the current state where other processes can read it."""
+    line = "%s %s %d 1\n" % (
+        percent if percent is not None else "-1",
+        format_volts(volts),
+        1 if plugged else 0,
+    )
+    try:
+        PUBLISH.write_text(line)
+    except OSError:
+        pass  # /dev/shm missing is not a reason to stop watching the battery
+
+
+def wall(message):
+    """Broadcast to every terminal, including the HDMI console."""
+    try:
+        subprocess.run(["wall", message], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+    print(message, file=sys.stderr, flush=True)
+
+
+def poweroff():
+    subprocess.run(["systemctl", "poweroff"], check=False)
+
+
+def run_daemon(args):
+    """Poll, publish, and enforce the policy until killed."""
+    def on_warn(percent):
+        wall("pi-power: battery at %d%% on battery power. "
+             "Shutting down automatically at %d%%." % (percent, args.crit))
+
+    def on_shutdown(percent):
+        if args.dry_run:
+            wall("pi-power: battery at %d%%. Would shut down now (--dry-run)."
+                 % percent)
+            return
+        wall("pi-power: battery at %d%%. Shutting down now." % percent)
+        poweroff()
+
+    guard = Guard(args.warn, args.crit, args.dwell, args.repeat, on_warn, on_shutdown)
+    deadline = time.monotonic() + args.exit_after if args.exit_after else None
+    while True:
+        try:
+            backend, percent, volts, plugged = detect(args.backend)
+        except Unavailable as exc:
+            # A backend that goes missing mid-run (driver reload, server
+            # restart) must not take the policy down with it; keep looking.
+            print("pi-power: %s" % exc, file=sys.stderr, flush=True)
+            percent = volts = None
+            plugged = True  # unknown: do not halt on a reading we do not have
+        else:
+            if isinstance(percent, str):
+                percent = int(percent)
+        publish(percent, volts, plugged)
+        guard.step(time.monotonic(), percent, plugged)
+        if deadline is not None and time.monotonic() >= deadline:
+            return 0
+        time.sleep(args.interval)
+
+
 def format_volts(volts):
     """Match the PiSugar output: a bare number, no trailing-zero padding."""
     if volts is None:
@@ -142,7 +269,41 @@ def main():
     parser.add_argument(
         "--which", action="store_true",
         help="print only the name of the backend in use")
+    parser.add_argument(
+        "--daemon", action="store_true",
+        help="keep polling, publish to %s, and enforce the low-battery policy" % PUBLISH)
+    parser.add_argument(
+        "--interval", type=float, default=10.0, metavar="S",
+        help="--daemon poll interval in seconds (default: %(default)s)")
+    parser.add_argument(
+        "--warn", type=int, default=10, metavar="PCT",
+        help="--daemon: warn on the console at or below this %% (default: %(default)s)")
+    parser.add_argument(
+        "--crit", type=int, default=3, metavar="PCT",
+        help="--daemon: shut down at or below this %% (default: %(default)s)")
+    parser.add_argument(
+        "--dwell", type=float, default=60.0, metavar="S",
+        help="--daemon: how long the level must stay low before acting "
+             "(default: %(default)s)")
+    parser.add_argument(
+        "--repeat", type=float, default=300.0, metavar="S",
+        help="--daemon: how often to repeat the warning (default: %(default)s)")
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="--daemon: say what the policy would do instead of shutting down")
+    parser.add_argument(
+        "--exit-after", type=float, default=0.0, metavar="S",
+        help=argparse.SUPPRESS)  # tests only: stop the loop after S seconds
     args = parser.parse_args()
+
+    if args.daemon:
+        if args.crit > args.warn:
+            parser.error("--crit (%d) must not be above --warn (%d)"
+                         % (args.crit, args.warn))
+        try:
+            return run_daemon(args)
+        except KeyboardInterrupt:
+            return 0
 
     try:
         name, percent, volts, plugged = detect(args.backend)
@@ -154,6 +315,7 @@ def main():
         print(name)
         return 0
 
+    publish(percent, volts, plugged)
     print("battery: %s" % percent)
     print("battery_v: %s" % format_volts(volts))
     print("battery_power_plugged: %s" % ("true" if plugged else "false"))

@@ -1,0 +1,15 @@
+[Unit]
+Description=pi-power: publish UPS/battery state to /dev/shm/pi-power and enforce the low-battery policy
+After=local-fs.target
+
+[Service]
+Type=simple
+# Runs as root: the shutdown at the critical level needs it, and so does wall
+# reaching every terminal. The reads themselves need no privileges.
+ExecStart=/usr/local/bin/pi-power --daemon
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
