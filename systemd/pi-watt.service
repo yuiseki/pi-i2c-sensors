@@ -1,0 +1,16 @@
+[Unit]
+Description=pi-watt: log the power balance so a slow drain is visible after the fact
+After=local-fs.target
+
+[Service]
+Type=simple
+User=yuiseki
+ExecStart=/usr/local/bin/pi-watt -w 60
+StandardOutput=append:/home/yuiseki/logs/power.log
+StandardError=append:/home/yuiseki/logs/power.log
+Restart=always
+RestartSec=10
+Nice=15
+
+[Install]
+WantedBy=multi-user.target

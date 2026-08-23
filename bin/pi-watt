@@ -1,0 +1,103 @@
+#!/bin/bash
+# pi-watt - where the power is actually going.
+#
+#   pi-watt             one line
+#   pi-watt -w [N]      a line every N seconds (default 60)
+#   pi-watt -v          one line plus the per-rail breakdown
+#
+# pi-power tells you the level. This tells you the balance: whether the supply
+# is covering the load, and what the load is made of.
+#
+# The X120x raises its power-loss GPIO whenever input is present, so the driver
+# reports status=Charging the whole way down to empty. It cannot see current.
+# So the state here comes from the sign of power_now, not from that status.
+#
+# rails= is the sum of the Pi 5 PMIC rails. It covers the SoC only, not the USB
+# ports or anything hanging off them, so it always reads below the wall draw.
+#
+# Environment overrides (used by the tests, handy for debugging):
+#     PI_WATT_SYSFS       sysfs root, default /sys
+#     PI_WATT_PMIC        command printing `vcgencmd pmic_read_adc` output
+#     PI_WATT_TEMP        command printing `vcgencmd measure_temp` output
+#     PI_WATT_THROTTLED   command printing `vcgencmd get_throttled` output
+
+set -u
+
+SYSFS=${PI_WATT_SYSFS:-/sys}
+PMIC=${PI_WATT_PMIC:-"vcgencmd pmic_read_adc"}
+TEMP=${PI_WATT_TEMP:-"vcgencmd measure_temp"}
+THROTTLED=${PI_WATT_THROTTLED:-"vcgencmd get_throttled"}
+
+BATT=$SYSFS/class/power_supply/x120x-battery
+AC=$SYSFS/class/power_supply/x120x-ac
+CHARGER=$SYSFS/class/power_supply/x120x-charger
+
+die() { echo "pi-watt: $*" >&2; exit 1; }
+
+# A value that cannot be read prints as unknown rather than vanishing, the same
+# way pi-power handles it.
+readval() { cat "$1" 2>/dev/null || echo unknown; }
+
+rails() {
+    awk '/current\(/ {n=$1; sub(/_A$/,"",n); split($2,a,"="); c[n]=a[2]+0}
+         /volt\(/    {n=$1; sub(/_V$/,"",n); split($2,a,"="); v[n]=a[2]+0}
+         END {if (!length(c)) {printf "unknown"; exit}
+              t=0; for (k in c) t += c[k]*v[k]; printf "%.2f", t}'
+}
+
+breakdown() {
+    awk '/current\(/ {n=$1; sub(/_A$/,"",n); split($2,a,"="); c[n]=a[2]+0}
+         /volt\(/    {n=$1; sub(/_V$/,"",n); split($2,a,"="); v[n]=a[2]+0}
+         END {for (k in c) if (v[k] > 0)
+                  printf "    %-11s %6.3f A x %6.3f V = %6.3f W\n", k, c[k], v[k], c[k]*v[k]}' \
+        | sort -t= -k2 -nr
+}
+
+sample() {
+    local cap volt pwr ac adc ext rail flow left
+    [ -d "$BATT" ] || die "no X120x battery at $BATT (is the x120x driver loaded?)"
+
+    cap=$(readval "$BATT/capacity")
+    volt=$(readval "$BATT/voltage_now")
+    pwr=$(readval "$BATT/power_now")
+    ac=$(readval "$AC/online")
+
+    adc=$($PMIC 2>/dev/null)
+    ext=$(printf '%s\n' "$adc" | sed -n 's/.*EXT5V_V volt(24)=\([0-9.]*\)V/\1/p')
+    ext=${ext:-unknown}
+    rail=$(printf '%s\n' "$adc" | rails)
+
+    # 100 mW of deadband: the gauge dithers around zero when the supply is
+    # exactly matching the load, and calling that DRAINING would cry wolf.
+    if [ "$pwr" = unknown ]; then flow=unknown
+    elif [ "$pwr" -gt 100000 ]; then flow=charging
+    elif [ "$pwr" -lt -100000 ]; then flow=DRAINING
+    else flow=float
+    fi
+
+    left=$(awk -v e="$(readval "$BATT/energy_now")" -v p="$pwr" \
+        'BEGIN {if (e+0 > 0 && p+0 < -100000) printf "%dmin left", e / -p * 60; else printf "-"}')
+
+    printf '%s ac=%s %-8s batt=%3s%% %sV %sW %-10s ext5v=%sV rails=%sW %s %s\n' \
+        "$(date '+%F %T')" "$ac" "$flow" "$cap" \
+        "$(awk -v x="$volt" 'BEGIN{if (x+0) printf "%.3f", x/1e6; else printf "unknown"}')" \
+        "$(awk -v x="$pwr"  'BEGIN{if (x=="unknown") printf "unknown"; else printf "%+6.2f", x/1e6}')" \
+        "$left" "$ext" "$rail" "$($TEMP 2>/dev/null)" "$($THROTTLED 2>/dev/null)"
+
+    # An input that is present while the pack drains is the signature of a
+    # supply too weak for the load. Say so, rather than leaving it in the log
+    # for somebody to work out later.
+    if [ "$flow" = DRAINING ] && [ "$ac" = 1 ]; then
+        echo "    input present but the pack is covering the shortfall: the supply is too weak"
+    fi
+
+    [ "${1:-}" = -v ] && printf '%s\n' "$adc" | breakdown
+    return 0
+}
+
+case "${1:-}" in
+    -w) while :; do sample; sleep "${2:-60}"; done ;;
+    -v) sample -v ;;
+    "") sample ;;
+    *)  die "usage: pi-watt [-w seconds | -v]" ;;
+esac

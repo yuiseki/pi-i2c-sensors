@@ -200,6 +200,46 @@ the policy work without losing the machine.
 Install it as a service with `systemd/pi-power.service`. It runs as root
 because the shutdown and `wall` need to; the reads themselves do not.
 
+### `pi-watt` - where the power is actually going
+
+`pi-power` tells you the level. `pi-watt` tells you the *balance*: whether the
+supply is covering the load, and what the load is made of.
+
+```
+$ pi-watt
+2026-08-23 16:07:20 ac=1 charging batt= 39% 3.910V  +6.00W -          ext5v=5.050V rails=2.53W temp=56.0'C throttled=0x0
+```
+
+The field that matters is the signed watts. A shortfall looks like this:
+
+```
+2026-08-23 15:11:21 ac=1 DRAINING batt= 22% 3.683V  -4.84W 52min left ext5v=5.001V rails=2.60W temp=54.3'C throttled=0x50000
+    input present but the pack is covering the shortfall: the supply is too weak
+```
+
+The X120x raises its power-loss GPIO whenever input is present, so the driver
+reports `status=Charging` the whole way down to empty. It is not lying about
+the input, it just cannot see the current. `pi-watt` ignores that status and
+derives the state from the sign of `power_now` instead, which is the number
+that actually knows.
+
+`rails=` is the sum of the Pi 5 PMIC rails, from `vcgencmd pmic_read_adc`. It
+covers the SoC only - not the USB ports or anything hanging off them - so it
+always reads well below the wall draw. `pi-watt -v` breaks it out per rail,
+which is how you find out that VDD_CORE is most of it.
+
+`ext5v=` and `throttled=` are the corroborating evidence. A supply at its limit
+sags, and `throttled` keeps the sticky bits: `0x50000` means undervoltage and
+throttling have both happened since boot, even if things look fine right now.
+
+Run it as `pi-watt -w [seconds]` for a line periodically, or install
+`systemd/pi-watt.service`, which appends to `~/logs/power.log`. That log is the
+point of the tool: a deck that drains over hours while plugged in looks fine
+every single time you check it, and only the trend gives it away.
+
+x120x only - it reads the pack through that driver and the rest through
+`vcgencmd`, so there is no PiSugar backend here.
+
 ## Orientation pipeline
 
 ```
@@ -220,12 +260,13 @@ So the orientation + GPS feeds are always available:
 
 ```bash
 sudo cp systemd/pi-orient.service systemd/pi-gps.service systemd/pi-env.service \
-        systemd/pi-power.service /etc/systemd/system/
+        systemd/pi-power.service systemd/pi-watt.service /etc/systemd/system/
 # the sensor units run as User=yuiseki; edit if your user differs
 sudo systemctl daemon-reload
 sudo systemctl enable --now pi-orient.service pi-gps.service pi-env.service \
-        pi-power.service
-systemctl status pi-orient.service pi-gps.service pi-env.service pi-power.service
+        pi-power.service pi-watt.service
+systemctl status pi-orient.service pi-gps.service pi-env.service \
+        pi-power.service pi-watt.service
 ```
 
 (`pi-env` and `pi-power` need `--daemon`, which their units already pass; the
