@@ -223,9 +223,18 @@ confidently wrong position is worse than none:
 
 It polls rather than holding the port. A connect costs about 0.6s, and keeping
 the port open would make every `meshtastic ...` command fail for as long as the
-service runs. The default interval is 10s, which has to stay under
-`pi-gps-track`'s `PI_GPS_TRACK_STALE` (15s): at 20s the file spent five seconds
-of every cycle looking dead and the track flapped.
+service runs.
+
+**Polling and publishing are separate rates**, and getting that wrong is this
+tool's whole bug history. The file's mtime does not mean "this fix is new"; it
+means "a publisher is alive and has a receiver". `pi-gps` rewrites on every GGA
+at 1 Hz while holding the last position, the map calls the file stale after
+**2s**, and `pi-gps-track` after 15s. Publishing only at the poll rate left the
+file looking dead for nine seconds out of every eleven and the map's GPS
+indicator flapped grey/green. So `--interval` (10s) reads the node and
+`--publish-every` (0.5s) rewrites the last good fix. Half a second rather than
+one because a poll costs ~0.6s inside the same loop; at 1s the gap touched the
+map's window once per poll. Measured worst-case age after the change: 1s.
 
 The unit runs it from `~/.venv-meshtastic` because that is where the meshtastic
 package lives. `pi-gps` itself stays standard-library-only.

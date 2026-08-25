@@ -121,6 +121,39 @@ def run_once(env_extra, byid_files=()):
     return r, os.path.join(tmp, "pi-gps")
 
 
+class LivenessTest(unittest.TestCase):
+    """The file's mtime is the liveness signal, not the fix's age.
+
+    The map calls /dev/shm/pi-gps stale after two seconds and pi-gps satisfies
+    that by rewriting on every GGA at 1 Hz, holding the last position. The first
+    version of this tool published only when it polled, once every eleven
+    seconds, so the map's GPS indicator sat grey for nine seconds out of every
+    eleven and flapped. The rates have to be separate.
+    """
+
+    def test_the_publish_rate_defaults_faster_than_the_map_calls_it_stale(self):
+        ap = [a for a in M.build_parser()._actions if a.dest == "publish_every"]
+        self.assertEqual(len(ap), 1)
+        self.assertLessEqual(ap[0].default, 2.0,
+                             "the map's freshness window is 2s")
+
+    def test_the_poll_rate_is_the_slow_one(self):
+        acts = {a.dest: a for a in M.build_parser()._actions}
+        poll, pub = acts["interval"], acts["publish_every"]
+        self.assertGreater(poll.default, pub.default,
+                           "reading the node is the expensive half")
+
+    def test_publishing_refreshes_the_mtime_even_when_nothing_moved(self):
+        # A stationary deck must still look alive.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "pi-gps")
+            M.publish(out, 35.0, 139.0, 0)
+            first = os.stat(out).st_mtime_ns
+            time.sleep(0.01)
+            M.publish(out, 35.0, 139.0, 0)
+            self.assertGreater(os.stat(out).st_mtime_ns, first)
+
+
 class StandDownTest(unittest.TestCase):
     USB_GPS = "usb-u-blox_AG_-_www.u-blox.com_u-blox_7_-_GPS_GNSS_Receiver-if00"
     NODE = "usb-Espressif_USB_JTAG_serial_debug_unit_20:6E:F1:15:B8:F4-if00"

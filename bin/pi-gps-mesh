@@ -29,6 +29,15 @@ It polls rather than holding the port open. A connect costs about 0.6s, and
 keeping the port would make `meshtastic ...` fail for as long as this runs --
 on a deck that exists to be tinkered with, that is the wrong trade.
 
+Polling and publishing are separate rates, and that distinction is the whole
+reason this file has a bug history. The file's mtime does not mean "this fix is
+new"; it means "a publisher is alive and has a receiver". pi-gps republishes on
+every GGA at 1 Hz, holding the last position, and the map judges the file stale
+after two seconds. Publishing only at the poll rate left the file looking dead
+for nine seconds out of every eleven, and the map's GPS indicator flapped
+between grey and green. So: poll the node slowly, republish the last good fix at
+the rate consumers expect.
+
 Environment overrides (used by the tests):
     PI_GPS_MESH_OUT       output file, default /dev/shm/pi-gps
     PI_GPS_MESH_PORT      node device path (default: autodetect)
@@ -142,22 +151,35 @@ def publish(out, lat, lon, sats):
         return False
 
 
-def main(argv=None):
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    # Shorter than pi-gps-track's staleness threshold (15s by default), which
-    # is what decides whether the published file still counts as live. At 20s
-    # the file spent five seconds of every cycle looking dead, and the track
-    # flapped between "fix" and "no receiver".
     ap.add_argument("--interval", type=float, default=10.0,
-                    help="seconds between polls (default 10; must stay under "
-                         "pi-gps-track's PI_GPS_TRACK_STALE, default 15)")
+                    help="seconds between reads of the node (default 10). The "
+                         "node's own GPS updates far slower than this, and each "
+                         "read briefly occupies the port")
+    # Not the poll rate. Consumers judge liveness by the file's mtime: the map
+    # calls it stale after 2s and pi-gps-track after 15s, and pi-gps satisfies
+    # both by rewriting on every GGA at 1 Hz. Matching that is what stops the
+    # indicator flapping.
+    #
+    # 0.5s rather than 1s because a poll costs about 0.6s of wall clock inside
+    # the same loop, which pushes the next write out by that much. At 1s the
+    # gap touched the map's 2s window once per poll; half a second leaves room
+    # for the poll to run without the file ever looking dead.
+    ap.add_argument("--publish-every", type=float, default=0.5,
+                    help="seconds between rewrites of the output file (default "
+                         "1, matching pi-gps; consumers read mtime as liveness)")
     ap.add_argument("--max-age", type=float, default=120.0,
                     help="ignore a node fix older than this many seconds "
                          "(default 120, matching the node's gps update interval)")
     ap.add_argument("--once", action="store_true",
                     help="poll once and exit, for checking by hand")
-    args = ap.parse_args(argv)
+    return ap
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
 
     tty = sys.stdout.isatty()
     said = None
@@ -168,35 +190,52 @@ def main(argv=None):
             print("pi-gps-mesh: %s" % state, flush=True)
             said = state
 
+    last = None          # (lat, lon, sats) from the most recent good read
+    next_poll = 0.0
+
     while True:
+        now = time.time()
         gps = find_usb_gps()
         if gps:
-            # pi-gps owns the file while a real receiver is attached.
+            # pi-gps owns the file while a real receiver is attached. Drop what
+            # we were holding so an unplug of the USB receiver does not make us
+            # republish a position from minutes ago.
+            last = None
             announce("standing down: USB GPS present (%s)" % os.path.basename(gps))
         else:
             node = find_node()
             if not node:
+                last = None
                 announce("no Meshtastic node attached")
-            else:
+            elif now >= next_poll or args.once:
+                next_poll = now + args.interval
                 pos = read_node_position(node)
                 got = usable(pos, args.max_age)
                 if got:
-                    lat, lon, sats = got
-                    publish(OUT, lat, lon, sats)
+                    last = got
                     announce("publishing from %s" % os.path.basename(node))
                     if tty:
                         print("  %.6f %.6f  sats=%d -> %s"
-                              % (lat, lon, sats, OUT), flush=True)
+                              % (got[0], got[1], got[2], OUT), flush=True)
                 else:
+                    # Stale is silence: stop republishing so the file ages out
+                    # and consumers read "no GPS" rather than a stale position.
+                    last = None
                     why = "no fix yet"
                     if pos and pos.get("locationSource") != "LOC_INTERNAL":
                         why = "node position is %s, not its own GPS" % pos.get("locationSource")
                     elif pos and pos.get("time"):
                         why = "node fix is stale"
                     announce("not publishing: %s" % why)
+
+        # Republish between polls. The value does not change; the mtime does,
+        # and that is what consumers read as "the receiver is still there".
+        if last is not None:
+            publish(OUT, *last)
+
         if args.once:
             return 0
-        time.sleep(args.interval)
+        time.sleep(args.publish_every)
 
 
 if __name__ == "__main__":
