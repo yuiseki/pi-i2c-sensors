@@ -4,8 +4,9 @@
 Writes "<lat> <lon> <fix> <sats_used> <sats_in_view>" to /dev/shm/pi-gps
 (tmpfs = RAM, no microSD wear) on every GGA fix. fix is the NMEA quality
 (0=no fix, 1=GPS, 2=DGPS); sats_used is from GGA (0 until fixed); sats_in_view
-is from GSV (useful while acquiring); lat/lon hold the last known position. Reads /dev/serial/by-id/*GPS* (falls back
-to /dev/ttyACM0); the user only needs to be in the dialout group (no sudo).
+is from GSV (useful while acquiring); lat/lon hold the last known position. Reads /dev/serial/by-id/*GPS* only -- never a bare /dev/ttyACM*, so other USB
+serial devices are left alone (set PI_GPS_DEV to override); the user only needs
+to be in the dialout group (no sudo).
 Dependency-light: parses NMEA directly, no pyserial/gpsd. Ctrl-C to quit.
 
 Runs harmlessly with no GPS attached: while no device is present (or after an
@@ -20,15 +21,37 @@ import os, sys, glob, time
 OUT = "/dev/shm/pi-gps"
 
 
+BY_ID = "/dev/serial/by-id"
+# Only a receiver whose by-id name says GPS is opened. There is deliberately no
+# bare /dev/ttyACM* fallback: those numbers are shared with every other USB
+# serial gadget (ESP32 boards, Meshtastic nodes), and adopting one both wedges
+# its port for its real owner and feeds us garbage instead of NMEA. Set
+# PI_GPS_DEV to force a path for a receiver whose by-id name omits "GPS".
+PATTERNS = ("*GPS*", "*gps*", "*GNSS*", "*gnss*", "*u-blox*", "*u_blox*")
+
+
 def find_dev():
-    for pat in ("*GPS*", "*GNSS*", "*u-blox*", "*u_blox*"):
-        g = sorted(glob.glob("/dev/serial/by-id/" + pat))
+    forced = os.environ.get("PI_GPS_DEV")
+    if forced:
+        return forced if os.path.exists(forced) else None
+    for pat in PATTERNS:
+        g = sorted(glob.glob(os.path.join(BY_ID, pat)))
         if g:
             return g[0]
-    for c in ("/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyUSB0"):
-        if os.path.exists(c):
-            return c
     return None
+
+
+def open_dev(path):
+    """Open the receiver without letting it become our controlling terminal.
+
+    Without O_NOCTTY the first tty a session leader opens becomes its ctty, and
+    an unplug then delivers SIGHUP. systemd starts us in our own session, so we
+    are that session leader: the hangup killed us on every unplug and systemd
+    quietly restarted us -- which is how this unit reached a restart counter of
+    106 (2026-07-28).
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NOCTTY)
+    return os.fdopen(fd, "r", errors="ignore")
 
 
 def nmea_ok(line):
@@ -88,7 +111,7 @@ def main():
                 print("pi-gps: %s -> %s" % (dev, OUT))
             continue
         try:
-            with open(dev, "r", errors="ignore") as f:
+            with open_dev(dev) as f:
                 for line in f:
                     line = line.strip()
                     if not nmea_ok(line):

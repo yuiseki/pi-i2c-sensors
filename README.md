@@ -200,6 +200,36 @@ the policy work without losing the machine.
 Install it as a service with `systemd/pi-power.service`. It runs as root
 because the shutdown and `wall` need to; the reads themselves do not.
 
+### `pi-gps-mesh` - the node's GPS is the deck's GPS
+
+The deck often has no USB GPS mouse attached, and usually does have a Meshtastic
+node plugged into it. The node is physically on the deck, so its fix is the
+deck's fix. This publishes it to the same `/dev/shm/pi-gps` that `pi-gps`
+writes, in the same five fields, so `pi-gps-track`, `pi-here`, `pi-poi --here`
+and the map's status bar all work unchanged and never learn which receiver
+spoke.
+
+Three rules decide when *not* to publish, which is the part that matters -- a
+confidently wrong position is worse than none:
+
+- **`pi-gps` wins.** While a USB NMEA receiver is present this stands down, so
+  the file has exactly one writer at a time and a dedicated receiver outranks a
+  side effect of the radio.
+- **Only `LOC_INTERNAL` counts.** A node's position can also be hand-set
+  (`LOC_MANUAL`) or heard over the mesh. Neither is this host's GPS.
+- **Stale is silence.** Past `--max-age` (120s) nothing is published, the file
+  goes stale, and consumers read that as "no GPS" -- the contract `pi-gps`
+  already has.
+
+It polls rather than holding the port. A connect costs about 0.6s, and keeping
+the port open would make every `meshtastic ...` command fail for as long as the
+service runs. The default interval is 10s, which has to stay under
+`pi-gps-track`'s `PI_GPS_TRACK_STALE` (15s): at 20s the file spent five seconds
+of every cycle looking dead and the track flapped.
+
+The unit runs it from `~/.venv-meshtastic` because that is where the meshtastic
+package lives. `pi-gps` itself stays standard-library-only.
+
 ### `pi-watt` - where the power is actually going
 
 `pi-power` tells you the level. `pi-watt` tells you the *balance*: whether the
