@@ -200,44 +200,51 @@ the policy work without losing the machine.
 Install it as a service with `systemd/pi-power.service`. It runs as root
 because the shutdown and `wall` need to; the reads themselves do not.
 
-### `pi-gps-mesh` - the node's GPS is the deck's GPS
+### `pi-mesh` - the mesh on the map, and the node's GPS as ours
 
-The deck often has no USB GPS mouse attached, and usually does have a Meshtastic
-node plugged into it. The node is physically on the deck, so its fix is the
-deck's fix. This publishes it to the same `/dev/shm/pi-gps` that `pi-gps`
-writes, in the same five fields, so `pi-gps-track`, `pi-here`, `pi-poi --here`
-and the map's status bar all work unchanged and never learn which receiver
-spoke.
+The Meshtastic node plugged into the deck knows two things worth having, and
+this publishes both from **one** connection:
 
-Three rules decide when *not* to publish, which is the part that matters -- a
-confidently wrong position is worse than none:
+**Where the other nodes are** goes into the `mesh` layer of the marker feed
+(`/dev/shm/pi-mesh-nodes`), in that feed's own format,
+`<id> <lat> <lon> <epoch> <shortName>`. The map colours by id prefix, so nodes
+get the node colour and POI searches keep theirs, and a position older than ten
+minutes is drawn faded rather than dropped -- a node last heard hours ago is
+still worth knowing about. This host's own node is deliberately left out: the
+map draws it separately, in its own colour, from `/dev/shm/pi-gps-lastfix`.
 
-- **`pi-gps` wins.** While a USB NMEA receiver is present this stands down, so
-  the file has exactly one writer at a time and a dedicated receiver outranks a
-  side effect of the radio.
-- **Only `LOC_INTERNAL` counts.** A node's position can also be hand-set
-  (`LOC_MANUAL`) or heard over the mesh. Neither is this host's GPS.
+**Where this host is**, when no USB GPS mouse is attached, goes to the same
+`/dev/shm/pi-gps` that `pi-gps` writes. The node is on the deck, so its fix is
+the deck's fix.
+
+Both live in one tool because **there is one serial port**. Two services polling
+the same node fight over it (`Could not exclusively lock port`), and while
+either holds it every `meshtastic ...` command fails.
+
+Three rules decide when *not* to publish a position -- a confidently wrong
+position is worse than none:
+
+- **`pi-gps` wins.** While a USB NMEA receiver is present the position half
+  stands down, so that file has one writer at a time. The markers keep going.
+- **Only `LOC_INTERNAL` counts** for this host. A node position can also be
+  hand-set or heard over the mesh; neither is this deck's GPS. (Other nodes'
+  hand-set positions *are* drawn -- that is simply where they say they are.)
 - **Stale is silence.** Past `--max-age` (120s) nothing is published, the file
-  goes stale, and consumers read that as "no GPS" -- the contract `pi-gps`
-  already has.
+  ages out, and consumers read that as "no GPS".
 
-It polls rather than holding the port. A connect costs about 0.6s, and keeping
-the port open would make every `meshtastic ...` command fail for as long as the
-service runs.
+**Polling and publishing are separate rates.** The file's mtime does not mean
+"this fix is new", it means "a publisher is alive": `pi-gps` rewrites on every
+GGA at 1 Hz while holding the last position, and the map calls the file stale
+after **2s**. Publishing only at the poll rate left it looking dead for nine
+seconds out of every eleven and the map's GPS indicator flapped. So
+`--interval` (10s) reads the node and `--publish-every` (0.5s) rewrites the last
+good fix. Half a second rather than one because a poll costs ~0.6s inside the
+same loop.
 
-**Polling and publishing are separate rates**, and getting that wrong is this
-tool's whole bug history. The file's mtime does not mean "this fix is new"; it
-means "a publisher is alive and has a receiver". `pi-gps` rewrites on every GGA
-at 1 Hz while holding the last position, the map calls the file stale after
-**2s**, and `pi-gps-track` after 15s. Publishing only at the poll rate left the
-file looking dead for nine seconds out of every eleven and the map's GPS
-indicator flapped grey/green. So `--interval` (10s) reads the node and
-`--publish-every` (0.5s) rewrites the last good fix. Half a second rather than
-one because a poll costs ~0.6s inside the same loop; at 1s the gap touched the
-map's window once per poll. Measured worst-case age after the change: 1s.
-
-The unit runs it from `~/.venv-meshtastic` because that is where the meshtastic
-package lives. `pi-gps` itself stays standard-library-only.
+The marker feed is shared with `pi-poi`, so both go through `geo.update_layer`,
+which locks the store and touches only its own key. `geo.RESERVED_LAYERS` keeps
+"clear the map" from taking the nodes off: they are not a search result, they
+are the radio reporting who is out there.
 
 ### `pi-watt` - where the power is actually going
 

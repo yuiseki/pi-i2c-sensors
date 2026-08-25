@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""pi-mesh : everything the attached Meshtastic node knows, on the map.
+
+The node plugged into this deck is the deck's window onto the mesh. It knows
+two things worth having, and this publishes both:
+
+**Where the other nodes are** -> the "mesh" layer of the marker feed, so the map
+draws them. Format is the feed's own: "<id> <lat> <lon> <epoch> <shortName>".
+The map colours a marker by its id, so these get the node colour and POI
+searches keep theirs, and a position older than ten minutes is drawn faded.
+
+**Where this host is**, when there is no USB GPS mouse attached -> the same
+/dev/shm/pi-gps that pi-gps writes. The node is on the deck, so its fix is the
+deck's fix; there is no reason to have a position and not use it.
+
+Both live here rather than in two services for one blunt reason: **there is one
+serial port**. Two processes polling the same node fight over it, and while
+either holds it every `meshtastic ...` command fails. One owner, one connection,
+both jobs.
+
+Three rules decide when NOT to publish a position, which is the part that
+matters -- a confidently wrong position is worse than none:
+
+- **pi-gps wins.** While a USB NMEA receiver is present this publishes no
+  position of its own, so the file has exactly one writer at a time.
+- **Only LOC_INTERNAL counts** for this host. A node position can also be
+  hand-set or heard over the mesh; neither is this deck's GPS.
+- **Stale is silence.** Past --max-age nothing is published, the file ages out,
+  and consumers read that as "no GPS" -- the contract pi-gps already has.
+
+The node feed is different: a node's last known position is worth drawing long
+after it was measured, which is why the map fades rather than drops it. So old
+node positions are published with their real timestamp and left to fade.
+
+Polling and publishing are separate rates. The file's mtime is not "this fix is
+new", it is "a publisher is alive": the map calls /dev/shm/pi-gps stale after
+two seconds, and pi-gps satisfies that by rewriting at 1 Hz while holding the
+last position. Publishing only at the poll rate makes the map's GPS indicator
+flap.
+
+Environment overrides (used by the tests):
+    PI_MESH_OUT_GPS       position file, default /dev/shm/pi-gps
+    PI_MESH_MARKERS       marker feed, default /dev/shm/pi-mesh-nodes
+    PI_MESH_LAYERS        layer store, default /dev/shm/pi-poi-layers.json
+    PI_MESH_PORT          node device path (default: autodetect)
+    PI_MESH_BYID          by-id directory, default /dev/serial/by-id
+"""
+import argparse
+import fnmatch
+import glob
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "pi-hear"))
+sys.path.append("/home/yuiseki/src/pi-hear")
+
+OUT_GPS = os.environ.get("PI_MESH_OUT_GPS", "/dev/shm/pi-gps")
+MARKERS = os.environ.get("PI_MESH_MARKERS", "/dev/shm/pi-mesh-nodes")
+LAYERS = os.environ.get("PI_MESH_LAYERS", "/dev/shm/pi-poi-layers.json")
+BY_ID = os.environ.get("PI_MESH_BYID", "/dev/serial/by-id")
+
+# The layer these markers live in. geo.RESERVED_LAYERS keeps "clear the map"
+# from taking them off: they are not a search result.
+LAYER = "mesh"
+
+GPS_PATTERNS = ("*GPS*", "*gps*", "*GNSS*", "*gnss*", "*u-blox*", "*u_blox*")
+# ESP32 boards with native USB enumerate as an Espressif JTAG/serial unit;
+# nRF52 boards (RAK, T-Echo) under their own names. By by-id name only, never a
+# bare ttyACM -- see pi-gps for why taking that number breaks its real owner.
+NODE_PATTERNS = ("*Espressif*", "*RAK*", "*Nordic*", "*Seeed*", "*Heltec*")
+
+
+def find_usb_gps():
+    for pat in GPS_PATTERNS:
+        g = sorted(glob.glob(os.path.join(BY_ID, pat)))
+        if g:
+            return g[0]
+    return None
+
+
+def find_node():
+    forced = os.environ.get("PI_MESH_PORT")
+    if forced:
+        return forced if os.path.exists(forced) else None
+    for pat in NODE_PATTERNS:
+        for path in sorted(glob.glob(os.path.join(BY_ID, pat))):
+            if not any(fnmatch.fnmatch(os.path.basename(path), p)
+                       for p in GPS_PATTERNS):
+                return path
+    return None
+
+
+def read_node(port):
+    """(my_node_id, nodes dict) from the attached node, or (None, {}).
+
+    Imported here rather than at module scope so this stays runnable and
+    testable on a host without the meshtastic package.
+    """
+    try:
+        import meshtastic.serial_interface as si
+    except ImportError:
+        print("pi-mesh: meshtastic package not installed", file=sys.stderr)
+        return None, {}
+    iface = None
+    try:
+        iface = si.SerialInterface(port)
+        me = iface.getMyNodeInfo()
+        mine = me["user"]["id"] if me else None
+        return mine, dict(iface.nodes or {})
+    except Exception as exc:                            # noqa: BLE001
+        # A busy port, an unplug, a protocol hiccup. Skip this round.
+        print("pi-mesh: %s" % exc, file=sys.stderr)
+        return None, {}
+    finally:
+        if iface is not None:
+            try:
+                iface.close()
+            except Exception:                           # noqa: BLE001
+                pass
+
+
+def own_position(nodes, mine, max_age, now=None):
+    """(lat, lon, sats) if this host's node has a live fix of its own."""
+    pos = (nodes.get(mine) or {}).get("position") if mine else None
+    if not pos or pos.get("locationSource") != "LOC_INTERNAL":
+        return None
+    lat, lon = pos.get("latitude"), pos.get("longitude")
+    if lat is None or lon is None or (lat == 0 and lon == 0):
+        return None
+    t = pos.get("time") or 0
+    if not t:
+        return None
+    age = max(0.0, (now if now is not None else time.time()) - t)
+    if age > max_age:
+        return None
+    return lat, lon, int(pos.get("satsInView") or 0)
+
+
+def safe_name(name, fallback):
+    """One field, no spaces: the feed is whitespace-separated and name is last.
+
+    The map parses with a stream extractor, so a name with a space in it would
+    silently lose everything after the first word.
+    """
+    s = "".join(ch for ch in str(name or "") if ch.isprintable())
+    s = "_".join(s.split())
+    return s or fallback
+
+
+def marker_lines(nodes, mine):
+    """One line per other node that has a position.
+
+    Our own node is left out on purpose: the map draws this host separately,
+    in its own colour, from /dev/shm/pi-gps-lastfix. Publishing it here too
+    would put two markers on one spot.
+    """
+    out = []
+    for nid, node in sorted(nodes.items()):
+        if mine and nid == mine:
+            continue
+        pos = (node or {}).get("position") or {}
+        lat, lon = pos.get("latitude"), pos.get("longitude")
+        if lat is None or lon is None or (lat == 0 and lon == 0):
+            continue
+        # A node's last known position is worth drawing long after it was
+        # measured -- the map fades it rather than dropping it -- so the real
+        # timestamp goes out even when it is old. lastHeard is the fallback for
+        # a position that arrived without one.
+        when = int(pos.get("time") or node.get("lastHeard") or 0)
+        user = (node or {}).get("user") or {}
+        ident = str(nid).lstrip("!") or "node"
+        name = safe_name(user.get("shortName") or user.get("longName"), ident)
+        out.append("%s %.6f %.6f %d %s" % (ident, float(lat), float(lon),
+                                           when, name))
+    return "\n".join(out)
+
+
+def publish_gps(out, lat, lon, sats):
+    # Same five fields as pi-gps. fix=1: a LOC_INTERNAL position that is not
+    # stale is a fix by definition.
+    tmp = out + ".tmp"
+    try:
+        with open(tmp, "w") as fh:
+            fh.write("%.6f %.6f %d %d %d\n" % (lat, lon, 1, sats, sats))
+        os.replace(tmp, out)
+        return True
+    except OSError:
+        return False
+
+
+def publish_markers(block):
+    """Into the shared layer store, so a POI search and this can coexist."""
+    try:
+        import geo
+    except ImportError:                                 # pragma: no cover
+        print("pi-mesh: geo module not importable; not publishing markers",
+              file=sys.stderr)
+        return False
+    try:
+        geo.update_layer(LAYER, block, markers=MARKERS, path=LAYERS)
+        return True
+    except OSError as exc:
+        print("pi-mesh: %s" % exc, file=sys.stderr)
+        return False
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--interval", type=float, default=10.0,
+                    help="seconds between reads of the node (default 10). Each "
+                         "read briefly occupies the port")
+    ap.add_argument("--max-age", type=float, default=120.0,
+                    help="ignore this host's own fix once it is older than this "
+                         "(default 120). Other nodes' positions are published "
+                         "however old and left to fade")
+    # Not the poll rate. The map calls /dev/shm/pi-gps stale after 2s, and a
+    # poll costs ~0.6s inside the same loop; at 1s the gap touched that window
+    # once per poll.
+    ap.add_argument("--publish-every", type=float, default=0.5,
+                    help="seconds between rewrites of the position file "
+                         "(default 0.5; consumers read mtime as liveness)")
+    ap.add_argument("--no-gps", action="store_true",
+                    help="publish node markers only, never this host's position")
+    ap.add_argument("--once", action="store_true",
+                    help="poll once and exit, for checking by hand")
+    return ap
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    tty = sys.stdout.isatty()
+    said = None
+    last = None            # (lat, lon, sats) from the most recent good read
+    next_poll = 0.0
+
+    def announce(state):
+        nonlocal said
+        if state != said:
+            print("pi-mesh: %s" % state, flush=True)
+            said = state
+
+    while True:
+        now = time.time()
+        node = find_node()
+        if not node:
+            last = None
+            announce("no Meshtastic node attached")
+        elif now >= next_poll or args.once:
+            next_poll = now + args.interval
+            mine, nodes = read_node(node)
+            if nodes:
+                block = marker_lines(nodes, mine)
+                publish_markers(block)
+                n = len(block.splitlines()) if block else 0
+                gps = find_usb_gps()
+                if args.no_gps or gps:
+                    # pi-gps owns the position file while a real receiver is
+                    # attached; drop what we held so an unplug does not leave
+                    # us republishing a position from minutes ago.
+                    last = None
+                    announce("%d node(s) on the map; position left to %s"
+                             % (n, "pi-gps" if gps else "nobody"))
+                else:
+                    got = own_position(nodes, mine, args.max_age)
+                    last = got
+                    announce("%d node(s) on the map; position %s"
+                             % (n, "from the node" if got else "not published"))
+                if tty and got_str(last):
+                    print("  %s" % got_str(last), flush=True)
+            else:
+                announce("node unreadable this round")
+
+        if last is not None and not args.no_gps:
+            publish_gps(OUT_GPS, *last)
+
+        if args.once:
+            return 0
+        time.sleep(args.publish_every)
+
+
+def got_str(last):
+    return "" if last is None else "%.6f %.6f sats=%d" % last
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nbye")

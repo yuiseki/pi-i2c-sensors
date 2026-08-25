@@ -1,0 +1,17 @@
+[Unit]
+Description=pi-mesh: draw the mesh on the map, and use the node's GPS when there is no USB receiver
+After=local-fs.target
+
+[Service]
+Type=simple
+User=yuiseki
+# One owner of the serial port. Two services polling the same node fight over
+# it, and while either holds it every `meshtastic ...` command fails. The
+# meshtastic package lives in this venv; pi-gps stays standard-library-only.
+ExecStart=/home/yuiseki/.venv-meshtastic/bin/python /usr/local/bin/pi-mesh
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
