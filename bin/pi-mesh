@@ -72,6 +72,9 @@ sys.path.append("/home/yuiseki/src/pi-hear")
 OUT_GPS = os.environ.get("PI_MESH_OUT_GPS", "/dev/shm/pi-gps")
 MARKERS = os.environ.get("PI_MESH_MARKERS", "/dev/shm/pi-mesh-nodes")
 LAYERS = os.environ.get("PI_MESH_LAYERS", "/dev/shm/pi-poi-layers.json")
+# Not in /dev/shm: this one has to survive a reboot, not just a restart.
+SHARE_STATE = os.environ.get("PI_MESH_SHARE_STATE",
+                            os.path.expanduser("~/.pi-mesh-shared"))
 BY_ID = os.environ.get("PI_MESH_BYID", "/dev/serial/by-id")
 
 # The layer these markers live in. geo.RESERVED_LAYERS keeps "clear the map"
@@ -198,6 +201,31 @@ def haversine_m(a, b):
     h = (math.sin(dphi / 2) ** 2
          + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2)
     return 2 * r * math.asin(math.sqrt(h))
+
+
+def load_shared(path):
+    """(lat, lon, when) last written into the node, or None.
+
+    A missing or damaged file is "no history", not an error: the cost is one
+    extra write, and refusing to start would cost the map its node markers.
+    """
+    try:
+        with open(path) as fh:
+            lat, lon, when = fh.read().split()
+        return float(lat), float(lon), float(when)
+    except (OSError, ValueError):
+        return None
+
+
+def save_shared(path, lat, lon, when):
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as fh:
+            fh.write("%.6f %.6f %.3f\n" % (lat, lon, when))
+        os.replace(tmp, path)
+    except OSError as exc:
+        print("pi-mesh: could not record the shared position: %s" % exc,
+              file=sys.stderr)
 
 
 def share_due(fix, last, move_m, max_interval, now=None):
@@ -346,7 +374,8 @@ def main(argv=None):
     said = None
     last = None            # (lat, lon, sats) from the most recent good read
     next_poll = 0.0
-    shared = None          # (lat, lon, when) last written into the node
+    # Loaded rather than started empty, so a restart is not a first fix.
+    shared = load_shared(SHARE_STATE)
 
     def announce(state):
         nonlocal said
@@ -382,6 +411,7 @@ def main(argv=None):
             if told:
                 lat, lon, when, why = told[0]
                 shared = (lat, lon, when)
+                save_shared(SHARE_STATE, lat, lon, when)
                 print("pi-mesh: told the node it is at %.6f,%.6f (%s)"
                       % (lat, lon, why), flush=True)
             if nodes:

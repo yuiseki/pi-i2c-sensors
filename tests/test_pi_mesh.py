@@ -278,5 +278,43 @@ class SharePositionTest(unittest.TestCase):
         self.assertIn("share_position", acts)
         self.assertFalse(acts["share_position"].default)
 
+
+class ShareStateTest(unittest.TestCase):
+    """What was last told to the node has to outlive this process.
+
+    The bridge this replaced kept it in a file; the first version of this did
+    not, and every restart logged "first fix" and wrote to flash again. With
+    Restart=always and RestartSec=10 a crash loop would have been 8640 erases a
+    day -- precisely the thing the distance rule exists to prevent.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pi-mesh-state.")
+        self.path = os.path.join(self.tmp, "shared")
+
+    def test_a_write_survives_a_restart(self):
+        M.save_shared(self.path, 35.72, 139.79, NOW)
+        self.assertEqual(M.load_shared(self.path), (35.72, 139.79, NOW))
+
+    def test_no_file_yet_is_not_an_error(self):
+        self.assertIsNone(M.load_shared(os.path.join(self.tmp, "nope")))
+
+    def test_a_damaged_file_is_treated_as_no_history(self):
+        """Losing the history costs one extra write. Crashing costs the map."""
+        with open(self.path, "w") as fh:
+            fh.write("not a position\n")
+        self.assertIsNone(M.load_shared(self.path))
+
+    def test_a_restart_right_after_a_write_does_not_write_again(self):
+        M.save_shared(self.path, 35.72, 139.79, NOW - 5)
+        last = M.load_shared(self.path)
+        due, _ = M.share_due((35.72, 139.79), last, 50.0, 300.0, now=NOW)
+        self.assertFalse(due, "a restart must not look like a first fix")
+
+    def test_the_state_path_is_overridable(self):
+        """So the tests, and a second deck, do not share one file."""
+        self.assertIn("PI_MESH_SHARE_STATE", open(TOOL, encoding="utf-8").read())
+
+
 if __name__ == "__main__":
     unittest.main()
