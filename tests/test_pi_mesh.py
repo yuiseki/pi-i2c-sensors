@@ -180,5 +180,103 @@ class StandDownTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(tmp, "pi-gps")))
 
 
+
+class SharePositionTest(unittest.TestCase):
+    """Sending this deck's own fix back into the node it is plugged into.
+
+    pi4-deck has a USB GPS mouse and a C6L whose own Grove GPS rarely fixes, so
+    the deck knows where it is and the mesh does not. A separate bridge used to
+    carry one to the other by shelling out to the meshtastic CLI, which cannot
+    work beside this: pi-mesh holds the only connection, and while it does every
+    CLI command fails. So the job moves in here, where the port is already open.
+
+    Two rules do the real work. Writing costs a flash erase, so a stationary deck
+    must not write on every poll; and the fix must come from a receiver rather
+    than from us, or the node's own position would travel out to the file and
+    back into the node it came from.
+    """
+
+    def test_a_first_fix_is_always_worth_sending(self):
+        due, why = M.share_due((35.7, 139.7), None, 50.0, 300.0, now=NOW)
+        self.assertTrue(due)
+        self.assertIn("first", why)
+
+    def test_a_deck_sitting_still_does_not_write(self):
+        """The cost here is flash, not time: --setlat erases a sector, and a
+        30s poll would be 2880 erases a day for a deck on a desk."""
+        last = (35.7, 139.7, NOW - 10)
+        due, _ = M.share_due((35.700001, 139.700001), last, 50.0, 300.0, now=NOW)
+        self.assertFalse(due)
+
+    def test_moving_far_enough_writes(self):
+        last = (35.7, 139.7, NOW - 10)
+        # ~111m north.
+        due, why = M.share_due((35.701, 139.7), last, 50.0, 300.0, now=NOW)
+        self.assertTrue(due)
+        self.assertIn("moved", why)
+
+    def test_a_stationary_deck_still_refreshes_eventually(self):
+        """Without this a parked node looks like it stopped reporting."""
+        last = (35.7, 139.7, NOW - 301)
+        due, why = M.share_due((35.7, 139.7), last, 50.0, 300.0, now=NOW)
+        self.assertTrue(due)
+        self.assertIn("heartbeat", why)
+
+    def test_we_never_send_a_position_we_published_ourselves(self):
+        """The guard against a loop. Without a receiver attached, the position
+        file is written by *this* process from the node's own fix; sending that
+        back would launder a node position into a hand-set one, and the
+        LOC_INTERNAL test that keeps a stale fix off the map would stop
+        applying to it."""
+        self.assertFalse(M.may_share(True, None))     # no receiver: never
+        self.assertTrue(M.may_share(True, "/dev/serial/by-id/usb-u-blox"))
+        self.assertFalse(M.may_share(False, "/dev/serial/by-id/usb-u-blox"))
+
+    def test_the_write_goes_through_and_is_remembered(self):
+        wrote = []
+        fix = (35.72, 139.79)
+        why = M.share_position(lambda *a: wrote.append(a), fix, None,
+                               50.0, 300.0, now=NOW)
+        self.assertIsNotNone(why)
+        self.assertEqual(wrote, [(35.72, 139.79, 0)])
+
+    def test_nothing_is_written_when_it_is_not_due(self):
+        wrote = []
+        last = (35.72, 139.79, NOW - 5)
+        why = M.share_position(lambda *a: wrote.append(a), (35.72, 139.79),
+                               last, 50.0, 300.0, now=NOW)
+        self.assertIsNone(why)
+        self.assertEqual(wrote, [])
+
+    def test_a_failed_write_is_not_remembered_as_a_success(self):
+        """Otherwise one failure suppresses retries for the whole interval."""
+        def boom(*a):
+            raise OSError("port went away")
+        why = M.share_position(boom, (35.72, 139.79), None, 50.0, 300.0, now=NOW)
+        self.assertIsNone(why)
+
+    def test_the_receiver_fix_must_be_fresh_and_real(self):
+        tmp = tempfile.mkdtemp(prefix="pi-mesh-fix.")
+        path = os.path.join(tmp, "pi-gps")
+        with open(path, "w") as fh:
+            fh.write("35.725783 139.790774 1 6 14\n")
+        self.assertEqual(M.receiver_fix(path, 10.0), (35.725783, 139.790774))
+        with open(path, "w") as fh:
+            fh.write("35.725783 139.790774 0 0 0\n")
+        self.assertIsNone(M.receiver_fix(path, 10.0), "fix=0 is not a fix")
+        os.utime(path, (time.time() - 60, time.time() - 60))
+        with open(path, "w") as fh:
+            fh.write("35.725783 139.790774 1 6 14\n")
+        os.utime(path, (time.time() - 60, time.time() - 60))
+        self.assertIsNone(M.receiver_fix(path, 10.0), "a stale file is not a fix")
+        self.assertIsNone(M.receiver_fix(os.path.join(tmp, "nope"), 10.0))
+
+    def test_sharing_is_opt_in(self):
+        """pi5-deck runs pi-mesh with no receiver attached and must not start
+        writing to its node's flash because this landed."""
+        acts = {a.dest: a for a in M.build_parser()._actions}
+        self.assertIn("share_position", acts)
+        self.assertFalse(acts["share_position"].default)
+
 if __name__ == "__main__":
     unittest.main()

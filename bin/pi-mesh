@@ -13,10 +13,22 @@ searches keep theirs, and a position older than ten minutes is drawn faded.
 /dev/shm/pi-gps that pi-gps writes. The node is on the deck, so its fix is the
 deck's fix; there is no reason to have a position and not use it.
 
-Both live here rather than in two services for one blunt reason: **there is one
-serial port**. Two processes polling the same node fight over it, and while
-either holds it every `meshtastic ...` command fails. One owner, one connection,
-both jobs.
+**Where this host is, told to the node** (--share-position), when a USB receiver
+*is* attached and the node's own GPS is not to be trusted. pi4-deck is that
+case: a u-blox mouse that fixes and a C6L whose Grove GPS rarely does, so the
+deck knows where it is while the mesh does not. Writing costs a flash erase, so
+it happens on 50 m of movement or every 5 minutes, whichever comes first.
+
+All of them live here rather than in separate services for one blunt reason:
+**there is one serial port**. Two processes polling the same node fight over it,
+and while either holds it every `meshtastic ...` command fails. That is exactly
+how the standalone bridge that used to do the third job died. One owner, one
+connection, all three jobs.
+
+Sharing is off by default and is refused outright without a receiver attached,
+because the second and third jobs are opposites: with no receiver this process
+*writes* the position file from the node's own fix, and feeding that back would
+launder a measured position into a hand-set one.
 
 Three rules decide when NOT to publish a position, which is the part that
 matters -- a confidently wrong position is worse than none:
@@ -48,6 +60,7 @@ Environment overrides (used by the tests):
 import argparse
 import fnmatch
 import glob
+import math
 import os
 import sys
 import time
@@ -92,8 +105,12 @@ def find_node():
     return None
 
 
-def read_node(port):
+def read_node(port, while_open=None):
     """(my_node_id, nodes dict) from the attached node, or (None, {}).
+
+    `while_open` is called with the open interface before it is closed. That is
+    the whole reason the position-sharing job lives in this process: opening the
+    port a second time to do it would fail while this one holds it.
 
     Imported here rather than at module scope so this stays runnable and
     testable on a host without the meshtastic package.
@@ -108,7 +125,10 @@ def read_node(port):
         iface = si.SerialInterface(port)
         me = iface.getMyNodeInfo()
         mine = me["user"]["id"] if me else None
-        return mine, dict(iface.nodes or {})
+        nodes = dict(iface.nodes or {})
+        if while_open is not None:
+            while_open(iface)
+        return mine, nodes
     except Exception as exc:                            # noqa: BLE001
         # A busy port, an unplug, a protocol hiccup. Skip this round.
         print("pi-mesh: %s" % exc, file=sys.stderr)
@@ -136,6 +156,85 @@ def own_position(nodes, mine, max_age, now=None):
     if age > max_age:
         return None
     return lat, lon, int(pos.get("satsInView") or 0)
+
+
+def receiver_fix(path, max_age, now=None):
+    """(lat, lon) from a USB receiver's position file, or None.
+
+    Same five fields and the same staleness contract pi-gps publishes: an old
+    file means "no GPS", not "the last place we saw one".
+    """
+    try:
+        age = (now if now is not None else time.time()) - os.path.getmtime(path)
+        if age > max_age:
+            return None
+        with open(path) as fh:
+            parts = fh.read().split()
+        lat, lon, fix = float(parts[0]), float(parts[1]), int(parts[2])
+    except (OSError, ValueError, IndexError):
+        return None
+    return (lat, lon) if fix >= 1 else None
+
+
+def may_share(enabled, usb_gps):
+    """Whether this host's fix may be written into the attached node.
+
+    It may only when a real receiver is attached. Without one, the position
+    file is written by *this* process out of the node's own fix, and sending
+    that back would launder a measured position into a hand-set one -- the
+    node would then report LOC_MANUAL forever, and the freshness rule that
+    keeps a dead fix off the map would no longer apply to it.
+    """
+    return bool(enabled and usb_gps)
+
+
+def haversine_m(a, b):
+    lat1, lon1 = a
+    lat2, lon2 = b
+    r = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    h = (math.sin(dphi / 2) ** 2
+         + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2)
+    return 2 * r * math.asin(math.sqrt(h))
+
+
+def share_due(fix, last, move_m, max_interval, now=None):
+    """(should_write, why). Writing costs a flash erase, so this is stingy.
+
+    setFixedPosition writes the device's config, which is NVS-backed. At a 10s
+    poll an always-write rule would be ~8600 erases a day for a deck sitting on
+    a desk. Distance is the real trigger; the interval is only so a parked node
+    does not look like it stopped reporting.
+    """
+    if last is None:
+        return True, "first fix"
+    if haversine_m(last[:2], fix) >= move_m:
+        return True, "moved"
+    age = (now if now is not None else time.time()) - last[2]
+    if age >= max_interval:
+        return True, "heartbeat (%ds)" % int(max_interval)
+    return False, ""
+
+
+def share_position(setter, fix, last, move_m, max_interval, now=None):
+    """Write the fix into the node if it is due. Returns why, or None.
+
+    A failed write returns None on purpose: recording it as done would suppress
+    every retry until the interval elapsed, turning one bad poll into minutes
+    of a silently wrong position on the mesh.
+    """
+    due, why = share_due(fix, last, move_m, max_interval, now=now)
+    if not due:
+        return None
+    try:
+        setter(fix[0], fix[1], 0)
+    except Exception as exc:                            # noqa: BLE001
+        print("pi-mesh: could not set the node position: %s" % exc,
+              file=sys.stderr)
+        return None
+    return why
 
 
 def safe_name(name, fallback):
@@ -225,6 +324,17 @@ def build_parser():
                          "(default 0.5; consumers read mtime as liveness)")
     ap.add_argument("--no-gps", action="store_true",
                     help="publish node markers only, never this host's position")
+    ap.add_argument("--share-position", action="store_true",
+                    help="write this host's USB-GPS fix into the attached "
+                         "node's fixed position, so the rest of the mesh can "
+                         "see this deck. Off by default: it writes to the "
+                         "node's flash, and it is only correct on a host that "
+                         "has a receiver of its own")
+    ap.add_argument("--share-move-m", type=float, default=50.0,
+                    help="metres of movement that trigger a write (default 50)")
+    ap.add_argument("--share-every", type=float, default=300.0,
+                    help="seconds after which a stationary deck writes anyway "
+                         "(default 300)")
     ap.add_argument("--once", action="store_true",
                     help="poll once and exit, for checking by hand")
     return ap
@@ -236,6 +346,7 @@ def main(argv=None):
     said = None
     last = None            # (lat, lon, sats) from the most recent good read
     next_poll = 0.0
+    shared = None          # (lat, lon, when) last written into the node
 
     def announce(state):
         nonlocal said
@@ -251,12 +362,32 @@ def main(argv=None):
             announce("no Meshtastic node attached")
         elif now >= next_poll or args.once:
             next_poll = now + args.interval
-            mine, nodes = read_node(node)
+            # Decided before the port is opened, because the write happens
+            # inside that one connection.
+            gps = find_usb_gps()
+            fix = (receiver_fix(OUT_GPS, args.max_age)
+                   if may_share(args.share_position, gps) else None)
+            told = []
+
+            def while_open(iface, fix=fix, told=told):
+                if fix is None:
+                    return
+                why = share_position(iface.localNode.setFixedPosition, fix,
+                                     shared, args.share_move_m,
+                                     args.share_every)
+                if why:
+                    told.append((fix[0], fix[1], time.time(), why))
+
+            mine, nodes = read_node(node, while_open=while_open)
+            if told:
+                lat, lon, when, why = told[0]
+                shared = (lat, lon, when)
+                print("pi-mesh: told the node it is at %.6f,%.6f (%s)"
+                      % (lat, lon, why), flush=True)
             if nodes:
                 block = marker_lines(nodes, mine)
                 publish_markers(block)
                 n = len(block.splitlines()) if block else 0
-                gps = find_usb_gps()
                 if args.no_gps or gps:
                     # pi-gps owns the position file while a real receiver is
                     # attached; drop what we held so an unplug does not leave
