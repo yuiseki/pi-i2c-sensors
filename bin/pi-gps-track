@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""pi-gps-track : append a position history from what pi-gps publishes.
+
+/dev/shm/pi-gps is a current-value file on tmpfs: it holds the last known lat/lon
+even after the fix is lost, and it goes stale when the receiver is unplugged. So
+nothing there survives a reboot and nothing there is a track. This process reads
+it once a second and appends a TSV line to ~/pi-gps-track.log:
+
+    <iso8601>\t<lat>\t<lon>\t<fix>\t<sats_used>\t<sats_in_view>\t<reason>
+
+A point is written only while the receiver actually has a fix, and only when it
+has moved MIN_DIST metres or MIN_INTERVAL seconds have passed since the last
+point - otherwise a machine sitting on a desk would write an identical line every
+second. reason is "first", "move" or "heartbeat" so the log says why each point
+is there.
+
+Dependency-light: standard library only, no pyserial/gpsd. The GPS itself belongs
+to pi-gps; this only reads its published value, so both can run at once.
+
+Environment:
+  PI_GPS_SHM           source file (default /dev/shm/pi-gps)
+  PI_GPS_TRACK_LOG     destination (default ~/pi-gps-track.log)
+  PI_GPS_TRACK_DIST    metres of movement that forces a point (default 10)
+  PI_GPS_TRACK_EVERY   seconds between points while stationary (default 300)
+  PI_GPS_TRACK_STALE   seconds before the source counts as dead (default 15)
+  PI_GPS_LASTFIX       last-fix publication (default /dev/shm/pi-gps-lastfix)
+
+Besides the track, the last position the receiver actually fixed on is
+published to /dev/shm/pi-gps-lastfix as "<lat> <lon> <epoch>". /dev/shm/pi-gps
+cannot answer "where was I last, and when" on its own: it keeps republishing
+the last known lat/lon with fix=0 and carries no timestamp for it. On startup
+the file is seeded from the tail of the track log, because tmpfs is empty after
+a reboot while the track is not.
+"""
+import datetime
+import math
+import os
+import sys
+import tempfile
+import time
+
+SHM = os.environ.get("PI_GPS_SHM", "/dev/shm/pi-gps")
+LOG = os.environ.get("PI_GPS_TRACK_LOG", os.path.expanduser("~/pi-gps-track.log"))
+MIN_DIST = float(os.environ.get("PI_GPS_TRACK_DIST", "10"))
+MIN_INTERVAL = float(os.environ.get("PI_GPS_TRACK_EVERY", "300"))
+STALE_AFTER = float(os.environ.get("PI_GPS_TRACK_STALE", "15"))
+LASTFIX = os.environ.get("PI_GPS_LASTFIX", "/dev/shm/pi-gps-lastfix")
+
+
+def parse_shm(text):
+    """Parse one pi-gps line into a dict, or None if it is not one."""
+    parts = (text or "").split()
+    if len(parts) != 5:
+        return None
+    try:
+        return {
+            "lat": float(parts[0]),
+            "lon": float(parts[1]),
+            "fix": int(parts[2]),
+            "sats_used": int(parts[3]),
+            "sats_in_view": int(parts[4]),
+        }
+    except ValueError:
+        return None
+
+
+def distance_m(lat1, lon1, lat2, lon2):
+    """Great-circle distance in metres."""
+    r = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def is_fresh(mtime, now, stale_after):
+    return (now - mtime) <= stale_after
+
+
+def should_record(cur, last, last_time, now, min_dist, min_interval):
+    """Why this sample deserves a track point, or None to skip it.
+
+    A sample without a fix is never recorded: pi-gps keeps republishing the last
+    known position with fix=0, and writing that would invent a track that the
+    receiver is not actually seeing.
+    """
+    if not cur or cur.get("fix", 0) < 1:
+        return None
+    if last is None:
+        return "first"
+    if distance_m(last["lat"], last["lon"], cur["lat"], cur["lon"]) >= min_dist:
+        return "move"
+    if now - last_time >= min_interval:
+        return "heartbeat"
+    return None
+
+
+def format_line(iso, sample, reason):
+    return "%s\t%.6f\t%.6f\t%d\t%d\t%d\t%s" % (
+        iso, sample["lat"], sample["lon"], sample["fix"],
+        sample["sats_used"], sample["sats_in_view"], reason)
+
+
+def publish_lastfix(lat, lon, when):
+    """Write "<lat> <lon> <epoch>" atomically, so a reader never sees a partial line."""
+    d = os.path.dirname(LASTFIX) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".pi-gps-lastfix-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("%.7f %.7f %d\n" % (lat, lon, int(when)))
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, LASTFIX)
+    except OSError:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def seed_lastfix_from_track():
+    """Recover the last fix across a reboot: /dev/shm is empty, the log is not."""
+    if os.path.exists(LASTFIX):
+        return
+    try:
+        with open(LOG, encoding="utf-8", errors="replace") as f:
+            last = None
+            for line in f:
+                if line.strip():
+                    last = line
+        if not last:
+            return
+        parts = last.rstrip("\n").split("\t")
+        when = datetime.datetime.fromisoformat(parts[0]).timestamp()
+        publish_lastfix(float(parts[1]), float(parts[2]), when)
+    except (OSError, ValueError, IndexError):
+        pass
+
+
+def read_source(now):
+    """Current sample, or None when the source is missing or stale."""
+    try:
+        st = os.stat(SHM)
+    except OSError:
+        return None
+    if not is_fresh(st.st_mtime, now, STALE_AFTER):
+        return None
+    try:
+        with open(SHM, encoding="utf-8", errors="replace") as f:
+            return parse_shm(f.read())
+    except OSError:
+        return None
+
+
+def main():
+    log = open(LOG, "a", buffering=1, encoding="utf-8")
+    seed_lastfix_from_track()
+    last = None
+    last_time = 0.0
+    while True:
+        now = time.time()
+        sample = read_source(now)
+        # The last fix is published whenever there is one, independently of the
+        # track's distance/interval thresholds: consumers want "where, and when",
+        # not a track point.
+        if sample and sample.get("fix", 0) >= 1:
+            publish_lastfix(sample["lat"], sample["lon"], now)
+        reason = should_record(sample, last, last_time, now, MIN_DIST, MIN_INTERVAL)
+        if reason:
+            iso = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+            log.write(format_line(iso, sample, reason) + "\n")
+            last, last_time = sample, now
+        time.sleep(1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)
